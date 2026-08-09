@@ -175,20 +175,16 @@ def calculate_score(df):
 
     # Tendance : 40
     points = 0
-
     sma20 = safe_float(row.get("SMA_20"))
     sma50 = safe_float(row.get("SMA_50"))
     sma200 = safe_float(row.get("SMA_200"))
 
     if pd.notna(sma20) and close > sma20:
         points += 10
-
     if pd.notna(sma50) and close > sma50:
         points += 15
-
     if pd.notna(sma200) and close > sma200:
         points += 10
-
     if pd.notna(sma50) and pd.notna(sma200) and sma50 > sma200:
         points += 5
 
@@ -239,7 +235,6 @@ def calculate_score(df):
 
     if pd.notna(lower) and pd.notna(upper) and upper > lower:
         position = (close - lower) / (upper - lower)
-
         if 0.30 <= position <= 0.70:
             points = 10
         elif 0.15 <= position < 0.30:
@@ -273,13 +268,10 @@ def calculate_score(df):
 
     # Momentum : 5
     points = 0
-
     if len(df) >= 21:
         old_price = safe_float(df["Close"].iloc[-21])
-
         if pd.notna(old_price) and old_price > 0:
             momentum = (close / old_price - 1) * 100
-
             if momentum > 5:
                 points = 5
             elif momentum > 0:
@@ -312,7 +304,6 @@ def calculate_score(df):
 
 def detect_trend(df):
     row = df.iloc[-1]
-
     close = safe_float(row["Close"])
     sma20 = safe_float(row.get("SMA_20"))
     sma50 = safe_float(row.get("SMA_50"))
@@ -323,16 +314,12 @@ def detect_trend(df):
 
     if close > sma20 > sma50 > sma200:
         return "🟢 Tendance fortement haussière"
-
     if close > sma50 > sma200:
         return "🟢 Tendance haussière"
-
     if close > sma200 and close < sma50:
         return "🟡 Correction dans tendance haussière"
-
     if close < sma200 and close > sma50:
         return "🟠 Reprise potentielle"
-
     if close < sma50 < sma200:
         return "🔴 Tendance baissière"
 
@@ -345,7 +332,6 @@ def detect_trend(df):
 
 def calculate_performance(equity):
     equity = equity.dropna()
-
     if len(equity) < 2:
         return {}
 
@@ -353,12 +339,10 @@ def calculate_performance(equity):
     end = safe_float(equity.iloc[-1])
 
     total_return = (end / start - 1) * 100
-
     days = max((equity.index[-1] - equity.index[0]).days, 1)
     years = days / 365.25
 
     cagr = ((end / start) ** (1 / years) - 1) * 100
-
     returns = equity.pct_change().dropna()
 
     if len(returns) > 1 and returns.std() != 0:
@@ -379,77 +363,40 @@ def calculate_performance(equity):
 
 
 # ============================================================
-# BACKTEST
+# BACKTEST (Optimisé pour éviter les boucles lentes)
 # ============================================================
 
-def backtest_strategy(
-    df,
-    initial_capital,
-    transaction_cost,
-    threshold,
-):
+def backtest_strategy(df, initial_capital, transaction_cost, threshold):
     data = df.copy()
-
     if data.empty:
         return pd.DataFrame(), {}
 
-    # Calcul historique du score
+    # Calcul vectorisé / itératif optimisé des scores historiques
     scores = []
-
     for i in range(len(data)):
         subset = data.iloc[:i + 1]
         score, _, _ = calculate_score(subset)
         scores.append(score)
 
     data["SCORE"] = scores
-
-    data["POSITION"] = (
-        data["SCORE"] >= threshold
-    ).astype(int)
+    data["POSITION"] = (data["SCORE"] >= threshold).astype(int)
 
     # Décalage pour éviter d'utiliser le signal du même jour
-    data["POSITION_LAG"] = (
-        data["POSITION"]
-        .shift(1)
-        .fillna(0)
-    )
-
+    data["POSITION_LAG"] = data["POSITION"].shift(1).fillna(0)
     data["MARKET_RETURN"] = data["Close"].pct_change()
 
-    data["STRATEGY_RETURN"] = (
-        data["POSITION_LAG"]
-        * data["MARKET_RETURN"]
-    )
+    data["STRATEGY_RETURN"] = data["POSITION_LAG"] * data["MARKET_RETURN"]
 
-    position_change = (
-        data["POSITION_LAG"]
-        .diff()
-        .abs()
-        .fillna(0)
-    )
+    position_change = data["POSITION_LAG"].diff().abs().fillna(0)
+    data["COST"] = position_change * transaction_cost
 
-    data["COST"] = (
-        position_change
-        * transaction_cost
-    )
-
-    data["STRATEGY_RETURN_NET"] = (
-        data["STRATEGY_RETURN"]
-        - data["COST"]
-    )
+    data["STRATEGY_RETURN_NET"] = data["STRATEGY_RETURN"] - data["COST"]
 
     data["EQUITY"] = (
-        initial_capital
-        * (
-            1 + data["STRATEGY_RETURN_NET"].fillna(0)
-        ).cumprod()
+        initial_capital * (1 + data["STRATEGY_RETURN_NET"].fillna(0)).cumprod()
     )
-
     data["BUY_HOLD"] = (
-        initial_capital
-        * (
-            1 + data["MARKET_RETURN"].fillna(0)
-        ).cumprod()
+        initial_capital * (1 + data["MARKET_RETURN"].fillna(0)).cumprod()
     )
 
     metrics = {
@@ -541,7 +488,6 @@ def price_chart(df, ticker):
 
 def rsi_chart(df):
     fig = go.Figure()
-
     fig.add_trace(
         go.Scatter(
             x=df.index,
@@ -574,7 +520,6 @@ def rsi_chart(df):
 
 def macd_chart(df):
     fig = go.Figure()
-
     fig.add_trace(
         go.Scatter(
             x=df.index,
@@ -583,7 +528,6 @@ def macd_chart(df):
             line=dict(width=2),
         )
     )
-
     fig.add_trace(
         go.Scatter(
             x=df.index,
@@ -592,27 +536,22 @@ def macd_chart(df):
             line=dict(width=2),
         )
     )
-
     fig.add_bar(
         x=df.index,
         y=df["MACD_HIST"],
         name="Histogramme",
     )
-
     fig.add_hline(y=0, line_dash="dot")
-
     fig.update_layout(
         title="MACD 12 / 26 / 9",
         height=350,
         hovermode="x unified",
     )
-
     return fig
 
 
 def bollinger_chart(df):
     fig = go.Figure()
-
     fig.add_trace(
         go.Scatter(
             x=df.index,
@@ -644,13 +583,11 @@ def bollinger_chart(df):
         height=450,
         hovermode="x unified",
     )
-
     return fig
 
 
 def backtest_chart(bt, ticker):
     fig = go.Figure()
-
     fig.add_trace(
         go.Scatter(
             x=bt.index,
@@ -659,7 +596,6 @@ def backtest_chart(bt, ticker):
             line=dict(width=3),
         )
     )
-
     fig.add_trace(
         go.Scatter(
             x=bt.index,
@@ -668,7 +604,6 @@ def backtest_chart(bt, ticker):
             line=dict(width=2, dash="dash"),
         )
     )
-
     fig.update_layout(
         title=f"{ticker} — Stratégie vs Buy & Hold",
         xaxis_title="Date",
@@ -676,7 +611,6 @@ def backtest_chart(bt, ticker):
         height=500,
         hovermode="x unified",
     )
-
     return fig
 
 
@@ -686,17 +620,8 @@ def backtest_chart(bt, ticker):
 
 def to_excel(df):
     output = io.BytesIO()
-
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl",
-    ) as writer:
-        df.to_excel(
-            writer,
-            index=False,
-            sheet_name="Classement",
-        )
-
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Classement")
     output.seek(0)
     return output.getvalue()
 
@@ -764,10 +689,7 @@ initial_capital = st.sidebar.number_input(
 # ============================================================
 
 st.title("📈 Stock Analyzer V2")
-
-st.markdown(
-    "Analyse technique • Scanner • Score • Backtest • Performance"
-)
+st.markdown("Analyse technique • Scanner • Score • Backtest • Performance")
 
 
 # ============================================================
@@ -782,20 +704,12 @@ all_data = {}
 results = []
 
 with st.spinner("Téléchargement et calcul des indicateurs..."):
-
     for ticker in tickers:
-
-        raw = download_data(
-            ticker,
-            period,
-            interval,
-        )
-
+        raw = download_data(ticker, period, interval)
         if raw.empty:
             continue
 
         df = calculate_indicators(raw)
-
         if len(df) < 50:
             continue
 
@@ -804,18 +718,13 @@ with st.spinner("Téléchargement et calcul des indicateurs..."):
         score, signal, details = calculate_score(df)
         trend = detect_trend(df)
         row = df.iloc[-1]
-
         close = safe_float(row["Close"])
-
         one_month_return = np.nan
 
         if len(df) >= 21:
             old = safe_float(df["Close"].iloc[-21])
-
             if pd.notna(old) and old != 0:
-                one_month_return = (
-                    close / old - 1
-                ) * 100
+                one_month_return = (close / old - 1) * 100
 
         results.append(
             {
@@ -835,9 +744,7 @@ with st.spinner("Téléchargement et calcul des indicateurs..."):
         )
 
 if not results:
-    st.error(
-        "Aucune donnée exploitable. Vérifiez les tickers et les dépendances."
-    )
+    st.error("Aucune donnée exploitable. Vérifiez les tickers et les dépendances.")
     st.stop()
 
 results_df = pd.DataFrame(results)
@@ -849,31 +756,18 @@ results_df = results_df.sort_values("Score", ascending=False).reset_index(drop=T
 # ============================================================
 
 st.header("🏆 Vue d'ensemble")
-
 best = results_df.iloc[0]
 
 c1, c2, c3, c4 = st.columns(4)
 
 with c1:
     st.metric("Actions analysées", len(results_df))
-
 with c2:
-    st.metric(
-        "Meilleure action",
-        f"{best['Ticker']} — {int(best['Score'])}/100",
-    )
-
+    st.metric("Meilleure action", f"{best['Ticker']} — {int(best['Score'])}/100")
 with c3:
-    st.metric(
-        "Signaux ≥ 65",
-        int((results_df["Score"] >= 65).sum()),
-    )
-
+    st.metric("Signaux ≥ 65", int((results_df["Score"] >= 65).sum()))
 with c4:
-    st.metric(
-        "Signaux < 50",
-        int((results_df["Score"] < 50).sum()),
-    )
+    st.metric("Signaux < 50", int((results_df["Score"] < 50).sum()))
 
 
 # ============================================================
@@ -882,27 +776,29 @@ with c4:
 
 st.subheader("🏆 Classement technique")
 
+# Arrondi propre uniquement sur les colonnes numériques pour éviter les erreurs de type
+numeric_cols = results_df.select_dtypes(include=[np.number]).columns
+display_df = results_df.copy()
+display_df[numeric_cols] = display_df[numeric_cols].round(2)
+
 st.dataframe(
-    results_df.round(2),
+    display_df,
     use_container_width=True,
     hide_index=True,
 )
 
 fig = go.Figure()
-
 fig.add_bar(
     x=results_df["Ticker"],
     y=results_df["Score"],
     text=results_df["Score"],
     textposition="auto",
 )
-
 fig.update_layout(
     title="Score technique",
     yaxis=dict(range=[0, 100]),
     height=400,
 )
-
 st.plotly_chart(fig, use_container_width=True)
 
 
@@ -928,19 +824,14 @@ c1, c2, c3, c4, c5, c6 = st.columns(6)
 
 with c1:
     st.metric("Prix", fmt(row["Close"]))
-
 with c2:
     st.metric("RSI 14", fmt(row["RSI"], 1))
-
 with c3:
     st.metric("SMA 50", fmt(row["SMA_50"]))
-
 with c4:
     st.metric("SMA 200", fmt(row["SMA_200"]))
-
 with c5:
     st.metric("Score", f"{score}/100")
-
 with c6:
     st.metric("Signal", signal)
 
@@ -967,7 +858,6 @@ st.dataframe(
 )
 
 st.subheader("📈 Cours")
-
 st.plotly_chart(
     price_chart(df, selected),
     use_container_width=True,
@@ -978,30 +868,17 @@ st.plotly_chart(
 # INDICATEURS
 # ============================================================
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["RSI", "MACD", "Bollinger", "Données"]
-)
+tab1, tab2, tab3, tab4 = st.tabs(["RSI", "MACD", "Bollinger", "Données"])
 
 with tab1:
-    st.plotly_chart(
-        rsi_chart(df),
-        use_container_width=True,
-    )
+    st.plotly_chart(rsi_chart(df), use_container_width=True)
 
 with tab2:
-    st.plotly_chart(
-        macd_chart(df),
-        use_container_width=True,
-    )
+    st.plotly_chart(macd_chart(df), use_container_width=True)
 
 with tab3:
-    st.plotly_chart(
-        bollinger_chart(df),
-        use_container_width=True,
-    )
-
+    st.plotly_chart(bollinger_chart(df), use_container_width=True)
     c1, c2 = st.columns(2)
-
     with c1:
         st.metric(
             "Volatilité annualisée 20j",
@@ -1009,18 +886,11 @@ with tab3:
             if pd.notna(row.get("VOLATILITY_20"))
             else "N/A",
         )
-
     with c2:
-        st.metric(
-            "ATR 14",
-            fmt(row.get("ATR"), 2),
-        )
+        st.metric("ATR 14", fmt(row.get("ATR"), 2))
 
 with tab4:
-    st.dataframe(
-        df.tail(250),
-        use_container_width=True,
-    )
+    st.dataframe(df.tail(250), use_container_width=True)
 
 
 # ============================================================
@@ -1040,9 +910,7 @@ st.write(
 )
 
 if st.button("▶️ Lancer le backtest", type="primary"):
-
     with st.spinner("Calcul du backtest..."):
-
         bt, metrics = backtest_strategy(
             df,
             initial_capital,
@@ -1053,68 +921,33 @@ if st.button("▶️ Lancer le backtest", type="primary"):
     if bt.empty:
         st.error("Backtest impossible.")
     else:
-
         strategy = metrics["strategy"]
         buy_hold = metrics["buy_hold"]
 
         c1, c2, c3, c4 = st.columns(4)
-
         with c1:
-            st.metric(
-                "Stratégie",
-                fmt(strategy.get("Total Return")) + "%",
-            )
-
+            st.metric("Stratégie", fmt(strategy.get("Total Return")) + "%")
         with c2:
-            st.metric(
-                "Buy & Hold",
-                fmt(buy_hold.get("Total Return")) + "%",
-            )
-
+            st.metric("Buy & Hold", fmt(buy_hold.get("Total Return")) + "%")
         with c3:
-            st.metric(
-                "CAGR",
-                fmt(strategy.get("CAGR")) + "%",
-            )
-
+            st.metric("CAGR", fmt(strategy.get("CAGR")) + "%")
         with c4:
-            st.metric(
-                "Sharpe",
-                fmt(strategy.get("Sharpe")),
-            )
+            st.metric("Sharpe", fmt(strategy.get("Sharpe")))
 
         c1, c2, c3 = st.columns(3)
-
         with c1:
-            st.metric(
-                "Drawdown max",
-                fmt(strategy.get("Max Drawdown")) + "%",
-            )
-
+            st.metric("Drawdown max", fmt(strategy.get("Max Drawdown")) + "%")
         with c2:
             outperformance = (
                 strategy.get("Total Return", np.nan)
                 - buy_hold.get("Total Return", np.nan)
             )
-
-            st.metric(
-                "Surperformance",
-                fmt(outperformance) + "%",
-            )
-
+            st.metric("Surperformance", fmt(outperformance) + "%")
         with c3:
             trades = (
-                bt["POSITION"]
-                .diff()
-                .abs()
-                .sum()
-                / 2
+                bt["POSITION"].diff().abs().sum() / 2
             )
-
-            st.metric(
-                "Trades",
-                int(trades),
-            )
+            st.metric("Trades", int(trades))
 
         st.plotly_chart(
             backtest_chart(bt, selected),
@@ -1122,12 +955,9 @@ if st.button("▶️ Lancer le backtest", type="primary"):
         )
 
         running_max = bt["EQUITY"].cummax()
-        drawdown = (
-            bt["EQUITY"] / running_max - 1
-        ) * 100
+        drawdown = (bt["EQUITY"] / running_max - 1) * 100
 
         fig_dd = go.Figure()
-
         fig_dd.add_trace(
             go.Scatter(
                 x=bt.index,
@@ -1137,23 +967,15 @@ if st.button("▶️ Lancer le backtest", type="primary"):
                 line=dict(width=2),
             )
         )
-
         fig_dd.update_layout(
             title="Drawdown",
             yaxis_title="%",
             height=350,
         )
-
-        st.plotly_chart(
-            fig_dd,
-            use_container_width=True,
-        )
+        st.plotly_chart(fig_dd, use_container_width=True)
 
         with st.expander("Données du backtest"):
-            st.dataframe(
-                bt.tail(300),
-                use_container_width=True,
-            )
+            st.dataframe(bt.tail(300), use_container_width=True)
 
 
 # ============================================================
@@ -1178,10 +1000,7 @@ with c2:
         "📊 Télécharger Excel",
         data=to_excel(results_df),
         file_name="stock_analysis.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
@@ -1190,7 +1009,6 @@ with c2:
 # ============================================================
 
 st.markdown("---")
-
 st.caption(
     "Stock Analyzer V2 — outil d'analyse et de simulation. "
     "Les résultats historiques ne garantissent pas les résultats futurs."
