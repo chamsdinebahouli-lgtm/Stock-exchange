@@ -1,10 +1,27 @@
 """
-Stock Analyzer V2
+Stock Analyzer V3
 Application Streamlit d'analyse technique et de backtest.
+
+Améliorations vs V2 :
+- Backtest performant (O(n) au lieu de O(n²)) et vectorisation du scoring historique
+- Annualisation dynamique selon l'intervalle (jour / semaine / mois)
+- Gestion du risque dans le backtest : stop-loss, take-profit, sizing basé sur la volatilité
+- Téléchargement des données en parallèle
+- auto_adjust=True pour éviter les artefacts liés aux splits
+- Backtest de portefeuille (agrégé, comparé à un panier équipondéré)
+- Heatmap de corrélation entre actifs
+- Alertes sur les changements de signaux récents
+- Historique du score dans le temps
+- Tickers ignorés listés explicitement
+- Section "Limites de l'outil"
+
+⚠️ Cet outil est pédagogique. Il ne constitue pas un conseil en investissement.
 """
 
 import io
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -21,17 +38,21 @@ from plotly.subplots import make_subplots
 # ============================================================
 
 st.set_page_config(
-    page_title="Stock Analyzer V2",
+    page_title="Stock Analyzer V3",
     page_icon="📈",
     layout="wide",
 )
-
-TRADING_DAYS = 252
 
 DEFAULT_TICKERS = (
     "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,"
     "AVGO,AMD,JPM,AIR.PA,MC.PA,TTE.PA,OR.PA"
 )
+
+ANNUALIZATION_FACTORS = {
+    "1d": 252,
+    "1wk": 52,
+    "1mo": 12,
+}
 
 
 # ============================================================
@@ -47,9 +68,13 @@ def safe_float(value):
         return np.nan
 
 
-def fmt(value, decimals=2):
+def fmt(value, decimals=2, suffix=""):
     value = safe_float(value)
-    return "N/A" if pd.isna(value) else f"{value:.{decimals}f}"
+    return "N/A" if pd.isna(value) else f"{value:.{decimals}f}{suffix}"
+
+
+def get_annualization_factor(interval):
+    return ANNUALIZATION_FACTORS.get(interval, 252)
 
 
 # ============================================================
@@ -63,7 +88,7 @@ def download_data(ticker, period, interval):
             ticker,
             period=period,
             interval=interval,
-            auto_adjust=False,
+            auto_adjust=True,   # évite les artefacts de prix liés aux splits/dividendes
             progress=False,
             threads=False,
         )
@@ -88,6 +113,24 @@ def download_data(ticker, period, interval):
     return data
 
 
+def download_all(tickers, period, interval, max_workers=8):
+    """Télécharge plusieurs tickers en parallèle (I/O bound -> threads)."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(download_data, ticker, period, interval): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                results[ticker] = future.result()
+            except Exception:
+                results[ticker] = pd.DataFrame()
+    # Restaure l'ordre initial des tickers
+    return {ticker: results[ticker] for ticker in tickers if ticker in results}
+
+
 # ============================================================
 # INDICATEURS
 # ============================================================
@@ -101,12 +144,7 @@ def calculate_indicators(data):
 
     df["RSI"] = ta.rsi(df["Close"], length=14)
 
-    macd = ta.macd(
-        df["Close"],
-        fast=12,
-        slow=26,
-        signal=9,
-    )
+    macd = ta.macd(df["Close"], fast=12, slow=26, signal=9)
 
     if macd is not None and not macd.empty:
         macd_main = [c for c in macd.columns if str(c).startswith("MACD_")]
@@ -120,11 +158,7 @@ def calculate_indicators(data):
         if macd_signal:
             df["MACD_SIGNAL"] = macd[macd_signal[0]]
 
-    bb = ta.bbands(
-        df["Close"],
-        length=20,
-        std=2,
-    )
+    bb = ta.bbands(df["Close"], length=20, std=2)
 
     if bb is not None and not bb.empty:
         lower = [c for c in bb.columns if str(c).startswith("BBL")]
@@ -138,164 +172,165 @@ def calculate_indicators(data):
         if upper:
             df["BB_UPPER"] = bb[upper[0]]
 
-    df["ATR"] = ta.atr(
-        df["High"],
-        df["Low"],
-        df["Close"],
-        length=14,
-    )
+    df["ATR"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
 
     df["VOLUME_SMA20"] = ta.sma(df["Volume"], length=20)
     df["VOLUME_RATIO"] = df["Volume"] / df["VOLUME_SMA20"]
 
     df["RETURN"] = df["Close"].pct_change()
 
+    annual_factor = st.session_state.get("annual_factor", 252)
     df["VOLATILITY_20"] = (
-        df["RETURN"].rolling(20).std()
-        * np.sqrt(TRADING_DAYS)
-        * 100
+        df["RETURN"].rolling(20).std() * np.sqrt(annual_factor) * 100
     )
 
     return df
 
 
 # ============================================================
-# SCORE
+# SCORE (vectorisé sur tout l'historique en une passe)
 # ============================================================
 
-def calculate_score(df):
-    if df.empty:
+def calculate_score_series(df):
+    """
+    Calcule le score (0-100) et sa décomposition pour CHAQUE ligne du DataFrame,
+    de façon vectorisée. Comme tous les indicateurs sont calculés de façon causale
+    (rolling windows classiques, aucune fuite du futur), le score à la date i ne
+    dépend que des données jusqu'à i inclus -> pas besoin de re-slicer le DataFrame
+    ligne par ligne comme dans une version naïve (ce qui serait O(n²)).
+    """
+    n = len(df)
+    idx = df.index
+
+    def col(name):
+        return df[name] if name in df.columns else pd.Series(np.nan, index=idx)
+
+    close = col("Close")
+    sma20, sma50, sma200 = col("SMA_20"), col("SMA_50"), col("SMA_200")
+    rsi = col("RSI")
+    macd, macd_signal = col("MACD"), col("MACD_SIGNAL")
+    bb_lower, bb_upper = col("BB_LOWER"), col("BB_UPPER")
+    volume_ratio = col("VOLUME_RATIO")
+
+    # --- Tendance : 40 pts ---
+    trend_points = (
+        np.where(close > sma20, 10, 0)
+        + np.where(close > sma50, 15, 0)
+        + np.where(close > sma200, 10, 0)
+        + np.where(sma50 > sma200, 5, 0)
+    ).astype(float)
+
+    # --- RSI : 20 pts ---
+    rsi_points = np.select(
+        [
+            (rsi >= 45) & (rsi <= 60),
+            (rsi >= 35) & (rsi < 45),
+            (rsi > 60) & (rsi <= 70),
+            (rsi >= 30) & (rsi < 35),
+            (rsi < 30),
+            (rsi > 70),
+        ],
+        [20, 15, 15, 10, 12, 5],
+        default=0,
+    ).astype(float)
+
+    # --- MACD : 15 pts ---
+    macd_valid = macd.notna() & macd_signal.notna()
+    macd_points = np.select(
+        [
+            macd_valid & (macd > macd_signal) & (macd > 0),
+            macd_valid & (macd > macd_signal),
+            macd_valid,
+        ],
+        [15, 10, 3],
+        default=0,
+    ).astype(float)
+
+    # --- Bollinger : 10 pts ---
+    bb_range = (bb_upper - bb_lower).replace(0, np.nan)
+    bb_valid = bb_lower.notna() & bb_upper.notna() & (bb_upper > bb_lower)
+    position = (close - bb_lower) / bb_range
+    bb_points = np.select(
+        [
+            bb_valid & (position >= 0.30) & (position <= 0.70),
+            bb_valid & (position >= 0.15) & (position < 0.30),
+            bb_valid & (position > 0.70) & (position <= 0.85),
+            bb_valid & (position < 0.15),
+            bb_valid,
+        ],
+        [10, 8, 7, 6, 3],
+        default=0,
+    ).astype(float)
+
+    # --- Volume : 10 pts ---
+    vol_points = np.select(
+        [
+            volume_ratio >= 1.5,
+            volume_ratio >= 1.0,
+            volume_ratio >= 0.7,
+            volume_ratio.notna(),
+        ],
+        [10, 8, 5, 2],
+        default=0,
+    ).astype(float)
+
+    # --- Momentum : 5 pts ---
+    old_price = close.shift(20)
+    momentum = (close / old_price - 1) * 100
+    momentum_valid = old_price.notna() & (old_price > 0)
+    momentum_points = np.select(
+        [
+            momentum_valid & (momentum > 5),
+            momentum_valid & (momentum > 0),
+            momentum_valid,
+        ],
+        [5, 3, 1],
+        default=0,
+    ).astype(float)
+
+    total = (
+        trend_points + rsi_points + macd_points
+        + bb_points + vol_points + momentum_points
+    )
+    total = pd.Series(total, index=idx).clip(0, 100).round().astype(int)
+
+    signal = pd.Series(np.select(
+        [total >= 80, total >= 65, total >= 50, total >= 35],
+        ["🟢 ACHAT FORT", "🟢 ACHAT", "🟡 NEUTRE", "🟠 VENTE PRUDENTE"],
+        default="🔴 VENTE",
+    ), index=idx)
+
+    components = pd.DataFrame(
+        {
+            "SCORE": total,
+            "SIGNAL": signal,
+            "Tendance": trend_points,
+            "RSI_pts": rsi_points,
+            "MACD_pts": macd_points,
+            "Bollinger_pts": bb_points,
+            "Volume_pts": vol_points,
+            "Momentum_pts": momentum_points,
+        },
+        index=idx,
+    )
+
+    return components
+
+
+def get_latest_score_info(components):
+    """Extrait le score, le signal et le détail pour la dernière ligne."""
+    if components.empty:
         return 0, "⚪ N/A", {}
-
-    row = df.iloc[-1]
-    close = safe_float(row["Close"])
-
-    score = 0
-    details = {}
-
-    # Tendance : 40
-    points = 0
-    sma20 = safe_float(row.get("SMA_20"))
-    sma50 = safe_float(row.get("SMA_50"))
-    sma200 = safe_float(row.get("SMA_200"))
-
-    if pd.notna(sma20) and close > sma20:
-        points += 10
-    if pd.notna(sma50) and close > sma50:
-        points += 15
-    if pd.notna(sma200) and close > sma200:
-        points += 10
-    if pd.notna(sma50) and pd.notna(sma200) and sma50 > sma200:
-        points += 5
-
-    score += points
-    details["Tendance"] = points
-
-    # RSI : 20
-    rsi = safe_float(row.get("RSI"))
-    points = 0
-
-    if pd.notna(rsi):
-        if 45 <= rsi <= 60:
-            points = 20
-        elif 35 <= rsi < 45:
-            points = 15
-        elif 60 < rsi <= 70:
-            points = 15
-        elif 30 <= rsi < 35:
-            points = 10
-        elif rsi < 30:
-            points = 12
-        elif rsi > 70:
-            points = 5
-
-    score += points
-    details["RSI"] = points
-
-    # MACD : 15
-    macd = safe_float(row.get("MACD"))
-    macd_signal = safe_float(row.get("MACD_SIGNAL"))
-    points = 0
-
-    if pd.notna(macd) and pd.notna(macd_signal):
-        if macd > macd_signal and macd > 0:
-            points = 15
-        elif macd > macd_signal:
-            points = 10
-        else:
-            points = 3
-
-    score += points
-    details["MACD"] = points
-
-    # Bollinger : 10
-    lower = safe_float(row.get("BB_LOWER"))
-    upper = safe_float(row.get("BB_UPPER"))
-    points = 0
-
-    if pd.notna(lower) and pd.notna(upper) and upper > lower:
-        position = (close - lower) / (upper - lower)
-        if 0.30 <= position <= 0.70:
-            points = 10
-        elif 0.15 <= position < 0.30:
-            points = 8
-        elif 0.70 < position <= 0.85:
-            points = 7
-        elif position < 0.15:
-            points = 6
-        else:
-            points = 3
-
-    score += points
-    details["Bollinger"] = points
-
-    # Volume : 10
-    volume_ratio = safe_float(row.get("VOLUME_RATIO"))
-    points = 0
-
-    if pd.notna(volume_ratio):
-        if volume_ratio >= 1.5:
-            points = 10
-        elif volume_ratio >= 1.0:
-            points = 8
-        elif volume_ratio >= 0.7:
-            points = 5
-        else:
-            points = 2
-
-    score += points
-    details["Volume"] = points
-
-    # Momentum : 5
-    points = 0
-    if len(df) >= 21:
-        old_price = safe_float(df["Close"].iloc[-21])
-        if pd.notna(old_price) and old_price > 0:
-            momentum = (close / old_price - 1) * 100
-            if momentum > 5:
-                points = 5
-            elif momentum > 0:
-                points = 3
-            else:
-                points = 1
-
-    score += points
-    details["Momentum"] = points
-
-    score = int(max(0, min(100, round(score))))
-
-    if score >= 80:
-        signal = "🟢 ACHAT FORT"
-    elif score >= 65:
-        signal = "🟢 ACHAT"
-    elif score >= 50:
-        signal = "🟡 NEUTRE"
-    elif score >= 35:
-        signal = "🟠 VENTE PRUDENTE"
-    else:
-        signal = "🔴 VENTE"
-
-    return score, signal, details
+    row = components.iloc[-1]
+    details = {
+        "Tendance": int(row["Tendance"]),
+        "RSI": int(row["RSI_pts"]),
+        "MACD": int(row["MACD_pts"]),
+        "Bollinger": int(row["Bollinger_pts"]),
+        "Volume": int(row["Volume_pts"]),
+        "Momentum": int(row["Momentum_pts"]),
+    }
+    return int(row["SCORE"]), row["SIGNAL"], details
 
 
 # ============================================================
@@ -327,10 +362,70 @@ def detect_trend(df):
 
 
 # ============================================================
+# ALERTES / SIGNAUX RECENTS
+# ============================================================
+
+def detect_recent_signals(df, lookback=10):
+    """Repère les croisements/événements techniques survenus dans les `lookback` dernières séances."""
+    events = []
+    recent = df.tail(lookback + 1)  # +1 pour pouvoir calculer les diff
+    if len(recent) < 2:
+        return events
+
+    macd = recent.get("MACD")
+    macd_signal = recent.get("MACD_SIGNAL")
+    close = recent["Close"]
+    sma50 = recent.get("SMA_50")
+    rsi = recent.get("RSI")
+    bb_upper = recent.get("BB_UPPER")
+    bb_lower = recent.get("BB_LOWER")
+
+    for i in range(1, len(recent)):
+        date = recent.index[i]
+
+        if macd is not None and macd_signal is not None:
+            prev_diff = safe_float(macd.iloc[i - 1]) - safe_float(macd_signal.iloc[i - 1])
+            curr_diff = safe_float(macd.iloc[i]) - safe_float(macd_signal.iloc[i])
+            if pd.notna(prev_diff) and pd.notna(curr_diff):
+                if prev_diff <= 0 < curr_diff:
+                    events.append((date, "🟢 MACD croise au-dessus du signal"))
+                elif prev_diff >= 0 > curr_diff:
+                    events.append((date, "🔴 MACD croise en-dessous du signal"))
+
+        if sma50 is not None:
+            prev_c, curr_c = safe_float(close.iloc[i - 1]), safe_float(close.iloc[i])
+            prev_s, curr_s = safe_float(sma50.iloc[i - 1]), safe_float(sma50.iloc[i])
+            if all(pd.notna(x) for x in [prev_c, curr_c, prev_s, curr_s]):
+                if prev_c <= prev_s < curr_c and curr_c > curr_s:
+                    events.append((date, "🟢 Cours croise au-dessus de la SMA 50"))
+                elif prev_c >= prev_s > curr_c and curr_c < curr_s:
+                    events.append((date, "🔴 Cours croise en-dessous de la SMA 50"))
+
+        if rsi is not None:
+            prev_r, curr_r = safe_float(rsi.iloc[i - 1]), safe_float(rsi.iloc[i])
+            if pd.notna(prev_r) and pd.notna(curr_r):
+                if prev_r < 30 <= curr_r:
+                    events.append((date, "🟢 RSI sort de la zone de survente (<30)"))
+                elif prev_r > 70 >= curr_r:
+                    events.append((date, "🔴 RSI sort de la zone de surachat (>70)"))
+
+        if bb_upper is not None and bb_lower is not None:
+            curr_c = safe_float(close.iloc[i])
+            curr_up = safe_float(bb_upper.iloc[i])
+            curr_low = safe_float(bb_lower.iloc[i])
+            if pd.notna(curr_c) and pd.notna(curr_up) and curr_c > curr_up:
+                events.append((date, "🟠 Cassure au-dessus de la bande de Bollinger haute"))
+            elif pd.notna(curr_c) and pd.notna(curr_low) and curr_c < curr_low:
+                events.append((date, "🟠 Cassure en-dessous de la bande de Bollinger basse"))
+
+    return sorted(events, key=lambda x: x[0], reverse=True)
+
+
+# ============================================================
 # PERFORMANCE
 # ============================================================
 
-def calculate_performance(equity):
+def calculate_performance(equity, annual_factor=252):
     equity = equity.dropna()
     if len(equity) < 2:
         return {}
@@ -338,15 +433,18 @@ def calculate_performance(equity):
     start = safe_float(equity.iloc[0])
     end = safe_float(equity.iloc[-1])
 
+    if start <= 0:
+        return {}
+
     total_return = (end / start - 1) * 100
     days = max((equity.index[-1] - equity.index[0]).days, 1)
     years = days / 365.25
 
-    cagr = ((end / start) ** (1 / years) - 1) * 100
+    cagr = ((end / start) ** (1 / years) - 1) * 100 if years > 0 else np.nan
     returns = equity.pct_change().dropna()
 
     if len(returns) > 1 and returns.std() != 0:
-        sharpe = returns.mean() / returns.std() * np.sqrt(TRADING_DAYS)
+        sharpe = returns.mean() / returns.std() * np.sqrt(annual_factor)
     else:
         sharpe = np.nan
 
@@ -363,48 +461,152 @@ def calculate_performance(equity):
 
 
 # ============================================================
-# BACKTEST (Optimisé pour éviter les boucles lentes)
+# BACKTEST (O(n), avec gestion du risque)
 # ============================================================
 
-def backtest_strategy(df, initial_capital, transaction_cost, threshold):
+@st.cache_data(ttl=900, show_spinner=False)
+def backtest_strategy(
+    df,
+    initial_capital,
+    transaction_cost,
+    threshold,
+    stop_loss_pct=0.0,
+    take_profit_pct=0.0,
+    sizing="fixed",
+    annual_factor=252,
+):
+    """
+    Backtest à une seule passe (O(n)).
+    - Le signal d'entrée est décidé sur le score de la veille (pas de fuite d'info).
+    - Le stop-loss / take-profit est vérifié intra-séance via le Low/High du jour.
+    - Le sizing "volatility" réduit l'exposition quand l'ATR relatif est élevé.
+    """
     data = df.copy()
-    if data.empty:
+    if data.empty or "SCORE" not in data.columns:
         return pd.DataFrame(), {}
 
-    # Calcul vectorisé / itératif optimisé des scores historiques
-    scores = []
-    for i in range(len(data)):
-        subset = data.iloc[:i + 1]
-        score, _, _ = calculate_score(subset)
-        scores.append(score)
+    n = len(data)
+    close = data["Close"].to_numpy()
+    high = data["High"].to_numpy()
+    low = data["Low"].to_numpy()
+    score = data["SCORE"].to_numpy()
+    atr = data["ATR"].to_numpy() if "ATR" in data.columns else np.full(n, np.nan)
 
-    data["SCORE"] = scores
-    data["POSITION"] = (data["SCORE"] >= threshold).astype(int)
+    signal_on = score >= threshold
 
-    # Décalage pour éviter d'utiliser le signal du même jour
-    data["POSITION_LAG"] = data["POSITION"].shift(1).fillna(0)
+    equity = np.empty(n)
+    position_flag = np.zeros(n)
+    equity[0] = initial_capital
+
+    in_position = False
+    entry_price = np.nan
+    position_size = 0.0
+    trades = 0
+
+    for i in range(1, n):
+        yesterday_signal = bool(signal_on[i - 1]) if not np.isnan(score[i - 1]) else False
+        net_return = 0.0
+
+        if in_position:
+            stop_hit = (
+                stop_loss_pct > 0
+                and not np.isnan(entry_price)
+                and low[i] <= entry_price * (1 - stop_loss_pct / 100)
+            )
+            tp_hit = (
+                take_profit_pct > 0
+                and not np.isnan(entry_price)
+                and high[i] >= entry_price * (1 + take_profit_pct / 100)
+            )
+            signal_exit = not yesterday_signal
+
+            if stop_hit or tp_hit:
+                exit_price = (
+                    entry_price * (1 - stop_loss_pct / 100) if stop_hit
+                    else entry_price * (1 + take_profit_pct / 100)
+                )
+                day_return = exit_price / close[i - 1] - 1
+                net_return = position_size * day_return - transaction_cost
+                in_position = False
+                trades += 1
+            elif signal_exit:
+                day_return = close[i] / close[i - 1] - 1
+                net_return = position_size * day_return - transaction_cost
+                in_position = False
+                trades += 1
+            else:
+                day_return = close[i] / close[i - 1] - 1
+                net_return = position_size * day_return
+                position_flag[i] = position_size
+        else:
+            if yesterday_signal:
+                in_position = True
+                entry_price = close[i]
+                if sizing == "volatility" and not np.isnan(atr[i]) and close[i] > 0:
+                    vol_pct = atr[i] / close[i]
+                    position_size = float(np.clip(0.02 / vol_pct, 0.2, 1.0)) if vol_pct > 0 else 1.0
+                else:
+                    position_size = 1.0
+                net_return = -transaction_cost  # coût d'entrée, pas de gain le jour même
+                trades += 1
+                position_flag[i] = position_size
+
+        equity[i] = equity[i - 1] * (1 + net_return)
+
+    data["SIGNAL_ON"] = signal_on
+    data["POSITION"] = position_flag
     data["MARKET_RETURN"] = data["Close"].pct_change()
-
-    data["STRATEGY_RETURN"] = data["POSITION_LAG"] * data["MARKET_RETURN"]
-
-    position_change = data["POSITION_LAG"].diff().abs().fillna(0)
-    data["COST"] = position_change * transaction_cost
-
-    data["STRATEGY_RETURN_NET"] = data["STRATEGY_RETURN"] - data["COST"]
-
-    data["EQUITY"] = (
-        initial_capital * (1 + data["STRATEGY_RETURN_NET"].fillna(0)).cumprod()
-    )
-    data["BUY_HOLD"] = (
-        initial_capital * (1 + data["MARKET_RETURN"].fillna(0)).cumprod()
-    )
+    data["EQUITY"] = equity
+    data["BUY_HOLD"] = initial_capital * (1 + data["MARKET_RETURN"].fillna(0)).cumprod()
 
     metrics = {
-        "strategy": calculate_performance(data["EQUITY"]),
-        "buy_hold": calculate_performance(data["BUY_HOLD"]),
+        "strategy": calculate_performance(data["EQUITY"], annual_factor),
+        "buy_hold": calculate_performance(data["BUY_HOLD"], annual_factor),
+        "trades": trades,
     }
 
     return data, metrics
+
+
+def portfolio_backtest(all_data_scored, initial_capital, transaction_cost, threshold,
+                        stop_loss_pct, take_profit_pct, sizing, annual_factor):
+    """
+    Backtest agrégé (équipondéré, sans rebalancement quotidien explicite) : moyenne des
+    courbes de capital normalisées de chaque actif. Approximation utile pour juger si le
+    signal apporte quelque chose sur l'ensemble du panier plutôt que sur un seul titre
+    choisi a posteriori.
+    """
+    normalized_curves = {}
+    normalized_bh = {}
+
+    for ticker, df in all_data_scored.items():
+        bt, _ = backtest_strategy(
+            df, initial_capital, transaction_cost, threshold,
+            stop_loss_pct, take_profit_pct, sizing, annual_factor,
+        )
+        if bt.empty:
+            continue
+        normalized_curves[ticker] = bt["EQUITY"] / initial_capital
+        normalized_bh[ticker] = bt["BUY_HOLD"] / initial_capital
+
+    if not normalized_curves:
+        return pd.DataFrame(), {}
+
+    combined = pd.concat(normalized_curves, axis=1).sort_index().ffill().dropna(how="all")
+    combined_bh = pd.concat(normalized_bh, axis=1).sort_index().ffill().dropna(how="all")
+
+    portfolio_equity = combined.mean(axis=1) * initial_capital
+    portfolio_bh = combined_bh.mean(axis=1) * initial_capital
+
+    result = pd.DataFrame({"EQUITY": portfolio_equity, "BUY_HOLD": portfolio_bh})
+
+    metrics = {
+        "strategy": calculate_performance(result["EQUITY"], annual_factor),
+        "buy_hold": calculate_performance(result["BUY_HOLD"], annual_factor),
+        "n_assets": len(normalized_curves),
+    }
+
+    return result, metrics
 
 
 # ============================================================
@@ -413,204 +615,130 @@ def backtest_strategy(df, initial_capital, transaction_cost, threshold):
 
 def price_chart(df, ticker):
     fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.75, 0.25],
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.04, row_heights=[0.75, 0.25],
     )
 
     fig.add_trace(
         go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Cours",
-        ),
-        row=1,
-        col=1,
+            x=df.index, open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"], name="Cours",
+        ), row=1, col=1,
     )
 
     for column, name, width in [
-        ("SMA_20", "SMA 20", 1),
-        ("SMA_50", "SMA 50", 2),
-        ("SMA_200", "SMA 200", 2),
-        ("BB_UPPER", "BB Haut", 1),
-        ("BB_LOWER", "BB Bas", 1),
+        ("SMA_20", "SMA 20", 1), ("SMA_50", "SMA 50", 2), ("SMA_200", "SMA 200", 2),
+        ("BB_UPPER", "BB Haut", 1), ("BB_LOWER", "BB Bas", 1),
     ]:
         if column in df:
             fig.add_trace(
                 go.Scatter(
-                    x=df.index,
-                    y=df[column],
-                    name=name,
-                    line=dict(
-                        width=width,
-                        dash="dot" if "BB_" in column else "solid",
-                    ),
-                ),
-                row=1,
-                col=1,
+                    x=df.index, y=df[column], name=name,
+                    line=dict(width=width, dash="dot" if "BB_" in column else "solid"),
+                ), row=1, col=1,
             )
 
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume"), row=2, col=1)
     fig.add_trace(
-        go.Bar(
-            x=df.index,
-            y=df["Volume"],
-            name="Volume",
-        ),
-        row=2,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["VOLUME_SMA20"],
-            name="Volume SMA20",
-            line=dict(width=2),
-        ),
-        row=2,
-        col=1,
+        go.Scatter(x=df.index, y=df["VOLUME_SMA20"], name="Volume SMA20", line=dict(width=2)),
+        row=2, col=1,
     )
 
     fig.update_layout(
         title=f"{ticker} — Cours, moyennes mobiles et volume",
-        height=700,
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
+        height=700, xaxis_rangeslider_visible=False, hovermode="x unified",
     )
-
     return fig
 
 
 def rsi_chart(df):
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["RSI"],
-            name="RSI 14",
-            line=dict(width=2),
-        )
-    )
-
-    for level, text, dash in [
-        (70, "Surachat", "dash"),
-        (50, "Neutre", "dot"),
-        (30, "Survente", "dash"),
-    ]:
-        fig.add_hline(
-            y=level,
-            line_dash=dash,
-            annotation_text=text,
-        )
-
-    fig.update_layout(
-        title="RSI 14",
-        height=350,
-        yaxis=dict(range=[0, 100]),
-        hovermode="x unified",
-    )
-
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI 14", line=dict(width=2)))
+    for level, text, dash in [(70, "Surachat", "dash"), (50, "Neutre", "dot"), (30, "Survente", "dash")]:
+        fig.add_hline(y=level, line_dash=dash, annotation_text=text)
+    fig.update_layout(title="RSI 14", height=350, yaxis=dict(range=[0, 100]), hovermode="x unified")
     return fig
 
 
 def macd_chart(df):
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["MACD"],
-            name="MACD",
-            line=dict(width=2),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["MACD_SIGNAL"],
-            name="Signal",
-            line=dict(width=2),
-        )
-    )
-    fig.add_bar(
-        x=df.index,
-        y=df["MACD_HIST"],
-        name="Histogramme",
-    )
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD_SIGNAL"], name="Signal", line=dict(width=2)))
+    fig.add_bar(x=df.index, y=df["MACD_HIST"], name="Histogramme")
     fig.add_hline(y=0, line_dash="dot")
-    fig.update_layout(
-        title="MACD 12 / 26 / 9",
-        height=350,
-        hovermode="x unified",
-    )
+    fig.update_layout(title="MACD 12 / 26 / 9", height=350, hovermode="x unified")
     return fig
 
 
 def bollinger_chart(df):
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["Close"],
-            name="Cours",
-            line=dict(width=2),
-        )
-    )
-
-    for column, name in [
-        ("BB_UPPER", "BB Haut"),
-        ("BB_MIDDLE", "BB Moyenne"),
-        ("BB_LOWER", "BB Bas"),
-    ]:
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Cours", line=dict(width=2)))
+    for column, name in [("BB_UPPER", "BB Haut"), ("BB_MIDDLE", "BB Moyenne"), ("BB_LOWER", "BB Bas")]:
         fig.add_trace(
             go.Scatter(
-                x=df.index,
-                y=df[column],
-                name=name,
-                line=dict(
-                    width=1,
-                    dash="dot" if column != "BB_MIDDLE" else "solid",
-                ),
+                x=df.index, y=df[column], name=name,
+                line=dict(width=1, dash="dot" if column != "BB_MIDDLE" else "solid"),
             )
         )
+    fig.update_layout(title="Bandes de Bollinger", height=450, hovermode="x unified")
+    return fig
 
+
+def score_history_chart(components, threshold):
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=components.index, y=components["SCORE"], name="Score",
+            line=dict(width=2), fill="tozeroy",
+        )
+    )
+    fig.add_hline(
+        y=threshold, line_dash="dash", line_color="orange",
+        annotation_text=f"Seuil d'entrée ({threshold})",
+    )
     fig.update_layout(
-        title="Bandes de Bollinger",
-        height=450,
-        hovermode="x unified",
+        title="Évolution du score technique dans le temps",
+        height=350, yaxis=dict(range=[0, 100]), hovermode="x unified",
     )
     return fig
 
 
-def backtest_chart(bt, ticker):
+def backtest_chart(bt, title):
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bt.index, y=bt["EQUITY"], name="Stratégie", line=dict(width=3)))
     fig.add_trace(
-        go.Scatter(
-            x=bt.index,
-            y=bt["EQUITY"],
-            name="Stratégie",
-            line=dict(width=3),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=bt.index,
-            y=bt["BUY_HOLD"],
-            name="Buy & Hold",
-            line=dict(width=2, dash="dash"),
-        )
+        go.Scatter(x=bt.index, y=bt["BUY_HOLD"], name="Buy & Hold", line=dict(width=2, dash="dash"))
     )
     fig.update_layout(
-        title=f"{ticker} — Stratégie vs Buy & Hold",
-        xaxis_title="Date",
-        yaxis_title="Capital",
-        height=500,
-        hovermode="x unified",
+        title=title, xaxis_title="Date", yaxis_title="Capital",
+        height=500, hovermode="x unified",
     )
+    return fig
+
+
+def drawdown_chart(equity):
+    running_max = equity.cummax()
+    drawdown = (equity / running_max - 1) * 100
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=equity.index, y=drawdown, name="Drawdown", fill="tozeroy", line=dict(width=2)))
+    fig.update_layout(title="Drawdown", yaxis_title="%", height=350)
+    return fig
+
+
+def correlation_heatmap(all_data):
+    closes = {ticker: df["Close"] for ticker, df in all_data.items()}
+    price_df = pd.concat(closes, axis=1).sort_index().ffill()
+    returns = price_df.pct_change().dropna(how="all")
+    corr = returns.corr()
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=corr.values, x=corr.columns, y=corr.columns,
+            colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+            text=np.round(corr.values, 2), texttemplate="%{text}",
+        )
+    )
+    fig.update_layout(title="Corrélation des rendements quotidiens", height=500)
     return fig
 
 
@@ -618,10 +746,11 @@ def backtest_chart(bt, ticker):
 # EXPORT
 # ============================================================
 
-def to_excel(df):
+def to_excel(sheets: dict):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Classement")
+        for name, frame in sheets.items():
+            frame.to_excel(writer, index=True, sheet_name=name[:31])
     output.seek(0)
     return output.getvalue()
 
@@ -632,11 +761,7 @@ def to_excel(df):
 
 st.sidebar.title("⚙️ Paramètres")
 
-ticker_input = st.sidebar.text_area(
-    "Actions à analyser",
-    value=DEFAULT_TICKERS,
-    height=130,
-)
+ticker_input = st.sidebar.text_area("Actions à analyser", value=DEFAULT_TICKERS, height=130)
 
 tickers = [
     ticker.strip().upper()
@@ -644,52 +769,49 @@ tickers = [
     if ticker.strip()
 ]
 
-period = st.sidebar.selectbox(
-    "Historique",
-    ["6mo", "1y", "2y", "5y", "10y", "max"],
-    index=3,
-)
+period = st.sidebar.selectbox("Historique", ["6mo", "1y", "2y", "5y", "10y", "max"], index=3)
+interval = st.sidebar.selectbox("Intervalle", ["1d", "1wk", "1mo"], index=0)
 
-interval = st.sidebar.selectbox(
-    "Intervalle",
-    ["1d", "1wk", "1mo"],
-    index=0,
-)
+st.session_state["annual_factor"] = get_annualization_factor(interval)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Backtest")
 
-threshold = st.sidebar.slider(
-    "Seuil d'entrée",
-    40,
-    90,
-    65,
-    5,
-)
+threshold = st.sidebar.slider("Seuil d'entrée", 40, 90, 65, 5,
+                               help="Position ouverte quand le score de la veille dépasse ce seuil.")
 
 transaction_cost = st.sidebar.number_input(
-    "Frais par transaction (%)",
-    min_value=0.0,
-    max_value=2.0,
-    value=0.10,
-    step=0.05,
+    "Frais par transaction (%)", min_value=0.0, max_value=2.0, value=0.10, step=0.05,
 )
 
 initial_capital = st.sidebar.number_input(
-    "Capital initial",
-    min_value=100.0,
-    max_value=10_000_000.0,
-    value=10_000.0,
-    step=1_000.0,
+    "Capital initial", min_value=100.0, max_value=10_000_000.0, value=10_000.0, step=1_000.0,
 )
+
+st.sidebar.markdown("**Gestion du risque**")
+
+stop_loss_pct = st.sidebar.slider(
+    "Stop-loss (%)", 0.0, 30.0, 8.0, 0.5,
+    help="0 = désactivé. Sortie si le plus bas du jour touche ce niveau sous le prix d'entrée.",
+)
+
+take_profit_pct = st.sidebar.slider(
+    "Take-profit (%)", 0.0, 60.0, 0.0, 1.0,
+    help="0 = désactivé. Sortie si le plus haut du jour touche ce niveau au-dessus du prix d'entrée.",
+)
+
+sizing_label = st.sidebar.selectbox(
+    "Sizing des positions", ["Fixe (100%)", "Basé sur la volatilité (ATR)"], index=0,
+)
+sizing = "volatility" if "volatilité" in sizing_label else "fixed"
 
 
 # ============================================================
 # TITRE
 # ============================================================
 
-st.title("📈 Stock Analyzer V2")
-st.markdown("Analyse technique • Scanner • Score • Backtest • Performance")
+st.title("📈 Stock Analyzer V3")
+st.markdown("Analyse technique • Scanner • Score • Backtest robuste • Risque • Portefeuille")
 
 
 # ============================================================
@@ -700,22 +822,32 @@ if not tickers:
     st.warning("Saisissez au moins un ticker.")
     st.stop()
 
+annual_factor = st.session_state["annual_factor"]
+
+with st.spinner("Téléchargement des données..."):
+    raw_data = download_all(tickers, period, interval)
+
 all_data = {}
 results = []
+skipped = []
 
-with st.spinner("Téléchargement et calcul des indicateurs..."):
+with st.spinner("Calcul des indicateurs et des scores..."):
     for ticker in tickers:
-        raw = download_data(ticker, period, interval)
+        raw = raw_data.get(ticker, pd.DataFrame())
         if raw.empty:
+            skipped.append((ticker, "Aucune donnée téléchargée (ticker invalide ?)"))
             continue
 
         df = calculate_indicators(raw)
         if len(df) < 50:
+            skipped.append((ticker, f"Historique insuffisant ({len(df)} lignes < 50)"))
             continue
 
+        components = calculate_score_series(df)
+        df = pd.concat([df, components], axis=1)
         all_data[ticker] = df
 
-        score, signal, details = calculate_score(df)
+        score, signal, details = get_latest_score_info(components)
         trend = detect_trend(df)
         row = df.iloc[-1]
         close = safe_float(row["Close"])
@@ -743,6 +875,11 @@ with st.spinner("Téléchargement et calcul des indicateurs..."):
             }
         )
 
+if skipped:
+    with st.expander(f"⚠️ {len(skipped)} ticker(s) ignoré(s)", expanded=False):
+        for ticker, reason in skipped:
+            st.write(f"- **{ticker}** : {reason}")
+
 if not results:
     st.error("Aucune donnée exploitable. Vérifiez les tickers et les dépendances.")
     st.stop()
@@ -759,7 +896,6 @@ st.header("🏆 Vue d'ensemble")
 best = results_df.iloc[0]
 
 c1, c2, c3, c4 = st.columns(4)
-
 with c1:
     st.metric("Actions analysées", len(results_df))
 with c2:
@@ -780,25 +916,26 @@ numeric_cols = results_df.select_dtypes(include=[np.number]).columns
 display_df = results_df.copy()
 display_df[numeric_cols] = display_df[numeric_cols].round(2)
 
-st.dataframe(
-    display_df,
-    use_container_width=True,
-    hide_index=True,
-)
+st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 fig = go.Figure()
-fig.add_bar(
-    x=results_df["Ticker"],
-    y=results_df["Score"],
-    text=results_df["Score"],
-    textposition="auto",
-)
-fig.update_layout(
-    title="Score technique",
-    yaxis=dict(range=[0, 100]),
-    height=400,
-)
+fig.add_bar(x=results_df["Ticker"], y=results_df["Score"], text=results_df["Score"], textposition="auto")
+fig.update_layout(title="Score technique", yaxis=dict(range=[0, 100]), height=400)
 st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================
+# CORRELATIONS
+# ============================================================
+
+if len(all_data) >= 2:
+    st.markdown("---")
+    st.header("🔗 Corrélations entre actifs")
+    st.caption(
+        "Un panier de titres fortement corrélés diversifie moins que ce que leur nombre "
+        "suggère. Une valeur proche de 1 indique des mouvements très similaires."
+    )
+    st.plotly_chart(correlation_heatmap(all_data), use_container_width=True)
 
 
 # ============================================================
@@ -808,66 +945,53 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 st.header("🔎 Analyse détaillée")
 
-selected = st.selectbox(
-    "Action",
-    list(all_data.keys()),
-)
-
+selected = st.selectbox("Action", list(all_data.keys()))
 df = all_data[selected]
+components = df[["SCORE", "SIGNAL", "Tendance", "RSI_pts", "MACD_pts", "Bollinger_pts", "Volume_pts", "Momentum_pts"]]
 
-score, signal, details = calculate_score(df)
+score, signal, details = get_latest_score_info(components)
 trend = detect_trend(df)
 row = df.iloc[-1]
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-
 with c1:
     st.metric("Prix", fmt(row["Close"]))
 with c2:
-    st.metric("RSI 14", fmt(row["RSI"], 1))
+    st.metric("RSI 14", fmt(row["RSI"], 1), help="< 30 : survente. > 70 : surachat.")
 with c3:
     st.metric("SMA 50", fmt(row["SMA_50"]))
 with c4:
     st.metric("SMA 200", fmt(row["SMA_200"]))
 with c5:
-    st.metric("Score", f"{score}/100")
+    st.metric("Score", f"{score}/100", help="Heuristique pondérée (tendance, RSI, MACD, Bollinger, volume, momentum). Non calibrée statistiquement — voir la section Limites.")
 with c6:
     st.metric("Signal", signal)
 
 st.info(f"**Tendance :** {trend}")
-
-st.progress(
-    score / 100,
-    text=f"Score technique : {score}/100",
-)
+st.progress(score / 100, text=f"Score technique : {score}/100")
 
 st.subheader("Décomposition du score")
+detail_df = pd.DataFrame({"Indicateur": list(details.keys()), "Points": list(details.values())})
+st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
-detail_df = pd.DataFrame(
-    {
-        "Indicateur": list(details.keys()),
-        "Points": list(details.values()),
-    }
-)
-
-st.dataframe(
-    detail_df,
-    use_container_width=True,
-    hide_index=True,
-)
+st.subheader("🔔 Signaux techniques récents")
+recent_events = detect_recent_signals(df, lookback=10)
+if recent_events:
+    events_df = pd.DataFrame(recent_events, columns=["Date", "Événement"])
+    events_df["Date"] = events_df["Date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(events_df, use_container_width=True, hide_index=True)
+else:
+    st.caption("Aucun croisement notable sur les 10 dernières séances.")
 
 st.subheader("📈 Cours")
-st.plotly_chart(
-    price_chart(df, selected),
-    use_container_width=True,
-)
+st.plotly_chart(price_chart(df, selected), use_container_width=True)
 
 
 # ============================================================
 # INDICATEURS
 # ============================================================
 
-tab1, tab2, tab3, tab4 = st.tabs(["RSI", "MACD", "Bollinger", "Données"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["RSI", "MACD", "Bollinger", "Score dans le temps", "Données"])
 
 with tab1:
     st.plotly_chart(rsi_chart(df), use_container_width=True)
@@ -879,42 +1003,39 @@ with tab3:
     st.plotly_chart(bollinger_chart(df), use_container_width=True)
     c1, c2 = st.columns(2)
     with c1:
-        st.metric(
-            "Volatilité annualisée 20j",
-            fmt(row.get("VOLATILITY_20"), 2) + "%"
-            if pd.notna(row.get("VOLATILITY_20"))
-            else "N/A",
-        )
+        st.metric("Volatilité annualisée 20j", fmt(row.get("VOLATILITY_20"), 2, "%"))
     with c2:
         st.metric("ATR 14", fmt(row.get("ATR"), 2))
 
 with tab4:
+    st.plotly_chart(score_history_chart(components, threshold), use_container_width=True)
+    st.caption("Permet de voir si le score est stable dans le temps ou s'il oscille beaucoup autour du seuil.")
+
+with tab5:
     st.dataframe(df.tail(250), use_container_width=True)
 
 
 # ============================================================
-# BACKTEST
+# BACKTEST (titre sélectionné)
 # ============================================================
 
 st.markdown("---")
-st.header("🧪 Backtest")
+st.header("🧪 Backtest — action sélectionnée")
 
 st.write(
     f"""
-    La stratégie prend une position lorsque le score atteint
-    **{threshold}/100**. Le signal est décalé d'une période
-    pour éviter d'utiliser directement l'information du jour.
-    Frais simulés : **{transaction_cost:.2f}%** par changement de position.
+    Position ouverte lorsque le score de la veille atteint **{threshold}/100** (signal décalé
+    d'une période pour éviter tout effet de bord). Frais simulés : **{transaction_cost:.2f}%**
+    par changement de position. Stop-loss : **{stop_loss_pct:.1f}%** •
+    Take-profit : **{take_profit_pct:.1f}%** (0 = désactivé) • Sizing : **{sizing_label}**.
     """
 )
 
 if st.button("▶️ Lancer le backtest", type="primary"):
     with st.spinner("Calcul du backtest..."):
         bt, metrics = backtest_strategy(
-            df,
-            initial_capital,
-            transaction_cost / 100,
-            threshold,
+            df, initial_capital, transaction_cost / 100, threshold,
+            stop_loss_pct, take_profit_pct, sizing, annual_factor,
         )
 
     if bt.empty:
@@ -925,56 +1046,107 @@ if st.button("▶️ Lancer le backtest", type="primary"):
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("Stratégie", fmt(strategy.get("Total Return")) + "%")
+            st.metric("Stratégie", fmt(strategy.get("Total Return"), suffix="%"))
         with c2:
-            st.metric("Buy & Hold", fmt(buy_hold.get("Total Return")) + "%")
+            st.metric("Buy & Hold", fmt(buy_hold.get("Total Return"), suffix="%"))
         with c3:
-            st.metric("CAGR", fmt(strategy.get("CAGR")) + "%")
+            st.metric("CAGR", fmt(strategy.get("CAGR"), suffix="%"))
         with c4:
             st.metric("Sharpe", fmt(strategy.get("Sharpe")))
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Drawdown max", fmt(strategy.get("Max Drawdown")) + "%")
+            st.metric("Drawdown max", fmt(strategy.get("Max Drawdown"), suffix="%"))
         with c2:
-            outperformance = (
-                strategy.get("Total Return", np.nan)
-                - buy_hold.get("Total Return", np.nan)
-            )
-            st.metric("Surperformance", fmt(outperformance) + "%")
+            outperformance = strategy.get("Total Return", np.nan) - buy_hold.get("Total Return", np.nan)
+            st.metric("Surperformance", fmt(outperformance, suffix="%"))
         with c3:
-            trades = (
-                bt["POSITION"].diff().abs().sum() / 2
-            )
-            st.metric("Trades", int(trades))
+            st.metric("Trades", int(metrics["trades"]))
 
-        st.plotly_chart(
-            backtest_chart(bt, selected),
-            use_container_width=True,
-        )
-
-        running_max = bt["EQUITY"].cummax()
-        drawdown = (bt["EQUITY"] / running_max - 1) * 100
-
-        fig_dd = go.Figure()
-        fig_dd.add_trace(
-            go.Scatter(
-                x=bt.index,
-                y=drawdown,
-                name="Drawdown",
-                fill="tozeroy",
-                line=dict(width=2),
-            )
-        )
-        fig_dd.update_layout(
-            title="Drawdown",
-            yaxis_title="%",
-            height=350,
-        )
-        st.plotly_chart(fig_dd, use_container_width=True)
+        st.plotly_chart(backtest_chart(bt, f"{selected} — Stratégie vs Buy & Hold"), use_container_width=True)
+        st.plotly_chart(drawdown_chart(bt["EQUITY"]), use_container_width=True)
 
         with st.expander("Données du backtest"):
             st.dataframe(bt.tail(300), use_container_width=True)
+
+        st.session_state["last_backtest"] = bt
+        st.session_state["last_backtest_ticker"] = selected
+
+
+# ============================================================
+# BACKTEST DE PORTEFEUILLE
+# ============================================================
+
+st.markdown("---")
+st.header("📦 Backtest de portefeuille (tous les tickers)")
+
+st.caption(
+    "Applique la même stratégie à chaque actif du panier puis moyenne les courbes de "
+    "capital normalisées (équipondéré, sans rebalancement quotidien explicite). "
+    "Un edge qui ne survit que sur un seul titre choisi après coup est un signe classique "
+    "de surapprentissage — tester sur l'ensemble du panier est plus honnête."
+)
+
+if st.button("▶️ Lancer le backtest de portefeuille"):
+    with st.spinner("Calcul du backtest de portefeuille..."):
+        pf_bt, pf_metrics = portfolio_backtest(
+            all_data, initial_capital, transaction_cost / 100, threshold,
+            stop_loss_pct, take_profit_pct, sizing, annual_factor,
+        )
+
+    if pf_bt.empty:
+        st.error("Backtest de portefeuille impossible.")
+    else:
+        pf_strategy = pf_metrics["strategy"]
+        pf_buy_hold = pf_metrics["buy_hold"]
+
+        st.write(f"Portefeuille équipondéré sur **{pf_metrics['n_assets']}** actifs.")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Stratégie", fmt(pf_strategy.get("Total Return"), suffix="%"))
+        with c2:
+            st.metric("Buy & Hold panier", fmt(pf_buy_hold.get("Total Return"), suffix="%"))
+        with c3:
+            st.metric("CAGR", fmt(pf_strategy.get("CAGR"), suffix="%"))
+        with c4:
+            st.metric("Sharpe", fmt(pf_strategy.get("Sharpe")))
+
+        st.plotly_chart(backtest_chart(pf_bt, "Portefeuille — Stratégie vs Buy & Hold"), use_container_width=True)
+        st.plotly_chart(drawdown_chart(pf_bt["EQUITY"]), use_container_width=True)
+
+        st.session_state["last_portfolio_backtest"] = pf_bt
+
+
+# ============================================================
+# LIMITES DE L'OUTIL
+# ============================================================
+
+st.markdown("---")
+with st.expander("⚠️ Limites de cet outil — à lire avant toute décision"):
+    st.markdown(
+        """
+- **Le score est une heuristique, pas un modèle validé statistiquement.** Les poids
+  (tendance 40, RSI 20, MACD 15, Bollinger 10, volume 10, momentum 5) et les seuils ont été
+  choisis à la main, pas calibrés sur des données. Rien ne garantit qu'ils ont un pouvoir
+  prédictif réel.
+- **Le backtest n'est pas out-of-sample.** Le seuil d'entrée est réglable librement en
+  observant les résultats passés, ce qui invite à l'ajuster jusqu'à trouver ce qui a "bien
+  marché" — un biais de surapprentissage classique. Une validation sérieuse nécessiterait un
+  découpage entraînement / test (walk-forward) sur plusieurs sous-périodes.
+- **Coûts de transaction simplifiés.** Seuls des frais fixes par changement de position sont
+  modélisés. Le slippage, le spread bid/ask et l'impact de marché ne le sont pas — la
+  performance réelle serait probablement inférieure à celle affichée, surtout avec un nombre
+  élevé de trades.
+- **Le stop-loss/take-profit est une approximation.** L'exécution est simulée au niveau du
+  stop/objectif via le plus bas/haut du jour, ce qui suppose une exécution parfaite — en
+  réalité, un gap à l'ouverture peut faire exécuter l'ordre à un prix plus défavorable.
+- **Le backtest de portefeuille est une moyenne de courbes normalisées**, pas une vraie
+  simulation avec rebalancement, ce qui sous-estime certains effets de friction.
+- **Ceci n'est pas un conseil en investissement.** Les performances passées, simulées ou
+  réelles, ne garantissent pas les performances futures.
+        """
+    )
 
 
 # ============================================================
@@ -988,16 +1160,22 @@ c1, c2 = st.columns(2)
 
 with c1:
     st.download_button(
-        "📄 Télécharger CSV",
+        "📄 Télécharger CSV (classement)",
         data=results_df.to_csv(index=False).encode("utf-8"),
         file_name="stock_analysis.csv",
         mime="text/csv",
     )
 
 with c2:
+    export_sheets = {"Classement": results_df}
+    if "last_backtest" in st.session_state:
+        export_sheets[f"Backtest_{st.session_state.get('last_backtest_ticker', 'ticker')}"] = st.session_state["last_backtest"]
+    if "last_portfolio_backtest" in st.session_state:
+        export_sheets["Backtest_Portefeuille"] = st.session_state["last_portfolio_backtest"]
+
     st.download_button(
-        "📊 Télécharger Excel",
-        data=to_excel(results_df),
+        "📊 Télécharger Excel (classement + backtests lancés)",
+        data=to_excel(export_sheets),
         file_name="stock_analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
@@ -1009,6 +1187,7 @@ with c2:
 
 st.markdown("---")
 st.caption(
-    "Stock Analyzer V2 — outil d'analyse et de simulation. "
-    "Les résultats historiques ne garantissent pas les résultats futurs."
+    "Stock Analyzer V3 — outil d'analyse et de simulation à but pédagogique. "
+    "Ce n'est pas un conseil en investissement. Les résultats historiques, simulés ou "
+    "réels, ne garantissent pas les résultats futurs."
 )
