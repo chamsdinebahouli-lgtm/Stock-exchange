@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import pandas-ta as ta
+import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -776,7 +776,6 @@ with c4:
 
 st.subheader("🏆 Classement technique")
 
-# Arrondi propre uniquement sur les colonnes numériques pour éviter les erreurs de type
 numeric_cols = results_df.select_dtypes(include=[np.number]).columns
 display_df = results_df.copy()
 display_df[numeric_cols] = display_df[numeric_cols].round(2)
