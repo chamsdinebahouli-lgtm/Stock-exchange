@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import ta as ta
+import pandas_ta_classic as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
