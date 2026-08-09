@@ -1,45 +1,10 @@
-```python
 """
 Stock Analyzer V2
-=================
-
 Application Streamlit d'analyse technique et de backtest.
-
-Fonctionnalités
----------------
-- Yahoo Finance
-- Analyse d'une ou plusieurs actions
-- RSI 14
-- SMA 20 / 50 / 200
-- MACD
-- Bandes de Bollinger
-- ATR
-- Volume
-- Score technique 0-100
-- Signal ACHAT / NEUTRE / VENTE
-- Scanner multi-actions
-- Classement
-- Backtest
-- Buy & Hold
-- Rendement cumulé
-- CAGR
-- Sharpe Ratio
-- Drawdown maximum
-- Graphiques Plotly
-- Export CSV
-- Export Excel
-- Interface Streamlit
-
-IMPORTANT
----------
-Cette application est un outil d'analyse technique et de simulation.
-Elle ne constitue pas une recommandation financière.
-Les résultats historiques ne garantissent pas les résultats futurs.
 """
 
 import io
 import warnings
-
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -59,67 +24,13 @@ st.set_page_config(
     page_title="Stock Analyzer V2",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
-
-
-# ============================================================
-# STYLE
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-
-    .main {
-        padding-top: 1rem;
-    }
-
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 3rem;
-    }
-
-    .title {
-        font-size: 2.5rem;
-        font-weight: 700;
-    }
-
-    .subtitle {
-        font-size: 1.1rem;
-        opacity: 0.75;
-        margin-bottom: 2rem;
-    }
-
-    .signal-box {
-        padding: 18px;
-        border-radius: 12px;
-        text-align: center;
-        font-size: 1.5rem;
-        font-weight: 700;
-        border: 1px solid rgba(128,128,128,0.25);
-    }
-
-    .small-text {
-        font-size: 0.85rem;
-        opacity: 0.7;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# CONSTANTES
-# ============================================================
 
 TRADING_DAYS = 252
 
 DEFAULT_TICKERS = (
-    "AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, "
-    "AVGO, AMD, JPM, AIR.PA, MC.PA, TTE.PA, OR.PA"
+    "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,"
+    "AVGO,AMD,JPM,AIR.PA,MC.PA,TTE.PA,OR.PA"
 )
 
 
@@ -128,38 +39,17 @@ DEFAULT_TICKERS = (
 # ============================================================
 
 def safe_float(value):
-    """Convertit proprement une valeur en float."""
-
     try:
         if pd.isna(value):
             return np.nan
-
         return float(value)
-
     except Exception:
         return np.nan
 
 
-def format_price(value):
-    """Format prix."""
-
+def fmt(value, decimals=2):
     value = safe_float(value)
-
-    if pd.isna(value):
-        return "N/A"
-
-    return f"{value:,.2f}"
-
-
-def format_percent(value):
-    """Format pourcentage."""
-
-    value = safe_float(value)
-
-    if pd.isna(value):
-        return "N/A"
-
-    return f"{value:.2f}%"
+    return "N/A" if pd.isna(value) else f"{value:.{decimals}f}"
 
 
 # ============================================================
@@ -167,13 +57,8 @@ def format_percent(value):
 # ============================================================
 
 @st.cache_data(ttl=900, show_spinner=False)
-def download_data(ticker, period="5y", interval="1d"):
-    """
-    Télécharge les données depuis Yahoo Finance.
-    """
-
+def download_data(ticker, period, interval):
     try:
-
         data = yf.download(
             ticker,
             period=period,
@@ -182,51 +67,22 @@ def download_data(ticker, period="5y", interval="1d"):
             progress=False,
             threads=False,
         )
-
     except Exception:
         return pd.DataFrame()
 
     if data is None or data.empty:
         return pd.DataFrame()
 
-    # Gestion des MultiIndex yfinance
     if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
 
-        # Dans certains cas le ticker est le deuxième niveau
-        if len(data.columns.levels) >= 2:
+    required = ["Open", "High", "Low", "Close", "Volume"]
 
-            try:
-                data.columns = data.columns.get_level_values(0)
-            except Exception:
-                pass
-
-    required = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-    ]
-
-    missing = [
-        col for col in required
-        if col not in data.columns
-    ]
-
-    if missing:
+    if not all(col in data.columns for col in required):
         return pd.DataFrame()
 
     data = data[required].copy()
-
-    data = data.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-        ]
-    )
-
+    data = data.dropna(subset=["Open", "High", "Low", "Close"])
     data.index = pd.to_datetime(data.index)
 
     return data
@@ -237,43 +93,13 @@ def download_data(ticker, period="5y", interval="1d"):
 # ============================================================
 
 def calculate_indicators(data):
-    """
-    Calcule l'ensemble des indicateurs techniques.
-    """
-
     df = data.copy()
 
-    # --------------------------------------------------------
-    # MOYENNES MOBILES
-    # --------------------------------------------------------
+    df["SMA_20"] = ta.sma(df["Close"], length=20)
+    df["SMA_50"] = ta.sma(df["Close"], length=50)
+    df["SMA_200"] = ta.sma(df["Close"], length=200)
 
-    df["SMA_20"] = ta.sma(
-        df["Close"],
-        length=20,
-    )
-
-    df["SMA_50"] = ta.sma(
-        df["Close"],
-        length=50,
-    )
-
-    df["SMA_200"] = ta.sma(
-        df["Close"],
-        length=200,
-    )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    df["RSI"] = ta.rsi(
-        df["Close"],
-        length=14,
-    )
-
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
+    df["RSI"] = ta.rsi(df["Close"], length=14)
 
     macd = ta.macd(
         df["Close"],
@@ -283,41 +109,16 @@ def calculate_indicators(data):
     )
 
     if macd is not None and not macd.empty:
+        macd_main = [c for c in macd.columns if str(c).startswith("MACD_")]
+        macd_hist = [c for c in macd.columns if str(c).startswith("MACDh_")]
+        macd_signal = [c for c in macd.columns if str(c).startswith("MACDs_")]
 
-        # pandas-ta produit normalement :
-        # MACD_12_26_9
-        # MACDh_12_26_9
-        # MACDs_12_26_9
-
-        macd_col = [
-            c for c in macd.columns
-            if str(c).startswith("MACD_")
-            and not str(c).startswith("MACDh")
-            and not str(c).startswith("MACDs")
-        ]
-
-        hist_col = [
-            c for c in macd.columns
-            if str(c).startswith("MACDh")
-        ]
-
-        signal_col = [
-            c for c in macd.columns
-            if str(c).startswith("MACDs")
-        ]
-
-        if macd_col:
-            df["MACD"] = macd[macd_col[0]]
-
-        if hist_col:
-            df["MACD_HIST"] = macd[hist_col[0]]
-
-        if signal_col:
-            df["MACD_SIGNAL"] = macd[signal_col[0]]
-
-    # --------------------------------------------------------
-    # BOLLINGER
-    # --------------------------------------------------------
+        if macd_main:
+            df["MACD"] = macd[macd_main[0]]
+        if macd_hist:
+            df["MACD_HIST"] = macd[macd_hist[0]]
+        if macd_signal:
+            df["MACD_SIGNAL"] = macd[macd_signal[0]]
 
     bb = ta.bbands(
         df["Close"],
@@ -326,50 +127,16 @@ def calculate_indicators(data):
     )
 
     if bb is not None and not bb.empty:
-
-        lower = [
-            c for c in bb.columns
-            if str(c).startswith("BBL")
-        ]
-
-        middle = [
-            c for c in bb.columns
-            if str(c).startswith("BBM")
-        ]
-
-        upper = [
-            c for c in bb.columns
-            if str(c).startswith("BBU")
-        ]
-
-        bandwidth = [
-            c for c in bb.columns
-            if str(c).startswith("BBB")
-        ]
-
-        percent = [
-            c for c in bb.columns
-            if str(c).startswith("BBP")
-        ]
+        lower = [c for c in bb.columns if str(c).startswith("BBL")]
+        middle = [c for c in bb.columns if str(c).startswith("BBM")]
+        upper = [c for c in bb.columns if str(c).startswith("BBU")]
 
         if lower:
             df["BB_LOWER"] = bb[lower[0]]
-
         if middle:
             df["BB_MIDDLE"] = bb[middle[0]]
-
         if upper:
             df["BB_UPPER"] = bb[upper[0]]
-
-        if bandwidth:
-            df["BB_WIDTH"] = bb[bandwidth[0]]
-
-        if percent:
-            df["BB_PERCENT"] = bb[percent[0]]
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
 
     df["ATR"] = ta.atr(
         df["High"],
@@ -378,309 +145,162 @@ def calculate_indicators(data):
         length=14,
     )
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    df["VOLUME_SMA20"] = ta.sma(
-        df["Volume"],
-        length=20,
-    )
-
-    df["VOLUME_RATIO"] = (
-        df["Volume"] /
-        df["VOLUME_SMA20"]
-    )
-
-    # --------------------------------------------------------
-    # RENDEMENTS
-    # --------------------------------------------------------
+    df["VOLUME_SMA20"] = ta.sma(df["Volume"], length=20)
+    df["VOLUME_RATIO"] = df["Volume"] / df["VOLUME_SMA20"]
 
     df["RETURN"] = df["Close"].pct_change()
 
-    # --------------------------------------------------------
-    # VOLATILITE
-    # --------------------------------------------------------
-
     df["VOLATILITY_20"] = (
-        df["RETURN"]
-        .rolling(20)
-        .std()
+        df["RETURN"].rolling(20).std()
         * np.sqrt(TRADING_DAYS)
         * 100
-    )
-
-    # --------------------------------------------------------
-    # TENDANCE
-    # --------------------------------------------------------
-
-    df["ABOVE_SMA50"] = (
-        df["Close"] > df["SMA_50"]
-    )
-
-    df["ABOVE_SMA200"] = (
-        df["Close"] > df["SMA_200"]
-    )
-
-    df["SMA50_ABOVE_SMA200"] = (
-        df["SMA_50"] > df["SMA_200"]
-    )
-
-    # --------------------------------------------------------
-    # SIGNAL DE CROSSOVER
-    # --------------------------------------------------------
-
-    df["SMA50_CROSS"] = (
-        df["SMA_50"] > df["SMA_200"]
-    ).astype(int)
-
-    df["MACD_BULLISH"] = (
-        df["MACD"] > df["MACD_SIGNAL"]
     )
 
     return df
 
 
 # ============================================================
-# SCORE TECHNIQUE
+# SCORE
 # ============================================================
 
 def calculate_score(df):
-    """
-    Score technique de 0 à 100.
-
-    Tendance : 40 points
-    RSI      : 20 points
-    MACD     : 15 points
-    Bollinger: 10 points
-    Volume   : 10 points
-    Momentum : 5 points
-    """
-
     if df.empty:
         return 0, "⚪ N/A", {}
 
     row = df.iloc[-1]
-
-    score = 0
-
-    details = {}
-
     close = safe_float(row["Close"])
 
-    # ========================================================
-    # TENDANCE — 40
-    # ========================================================
+    score = 0
+    details = {}
 
-    trend_score = 0
+    # Tendance : 40
+    points = 0
 
     sma20 = safe_float(row.get("SMA_20"))
     sma50 = safe_float(row.get("SMA_50"))
     sma200 = safe_float(row.get("SMA_200"))
 
     if pd.notna(sma20) and close > sma20:
-        trend_score += 10
+        points += 10
 
     if pd.notna(sma50) and close > sma50:
-        trend_score += 15
+        points += 15
 
     if pd.notna(sma200) and close > sma200:
-        trend_score += 10
+        points += 10
 
-    if (
-        pd.notna(sma50)
-        and pd.notna(sma200)
-        and sma50 > sma200
-    ):
-        trend_score += 5
+    if pd.notna(sma50) and pd.notna(sma200) and sma50 > sma200:
+        points += 5
 
-    score += trend_score
+    score += points
+    details["Tendance"] = points
 
-    details["Tendance"] = trend_score
-
-    # ========================================================
-    # RSI — 20
-    # ========================================================
-
+    # RSI : 20
     rsi = safe_float(row.get("RSI"))
-
-    rsi_score = 0
+    points = 0
 
     if pd.notna(rsi):
-
         if 45 <= rsi <= 60:
-            rsi_score = 20
-
+            points = 20
         elif 35 <= rsi < 45:
-            rsi_score = 15
-
+            points = 15
         elif 60 < rsi <= 70:
-            rsi_score = 15
-
+            points = 15
         elif 30 <= rsi < 35:
-            rsi_score = 10
-
+            points = 10
         elif rsi < 30:
-            rsi_score = 12
-
+            points = 12
         elif rsi > 70:
-            rsi_score = 5
+            points = 5
 
-    score += rsi_score
+    score += points
+    details["RSI"] = points
 
-    details["RSI"] = rsi_score
-
-    # ========================================================
-    # MACD — 15
-    # ========================================================
-
+    # MACD : 15
     macd = safe_float(row.get("MACD"))
     macd_signal = safe_float(row.get("MACD_SIGNAL"))
-
-    macd_score = 0
+    points = 0
 
     if pd.notna(macd) and pd.notna(macd_signal):
-
         if macd > macd_signal and macd > 0:
-            macd_score = 15
-
+            points = 15
         elif macd > macd_signal:
-            macd_score = 10
-
+            points = 10
         else:
-            macd_score = 3
+            points = 3
 
-    score += macd_score
+    score += points
+    details["MACD"] = points
 
-    details["MACD"] = macd_score
-
-    # ========================================================
-    # BOLLINGER — 10
-    # ========================================================
-
-    bb_score = 0
-
+    # Bollinger : 10
     lower = safe_float(row.get("BB_LOWER"))
     upper = safe_float(row.get("BB_UPPER"))
+    points = 0
 
-    if (
-        pd.notna(lower)
-        and pd.notna(upper)
-        and upper > lower
-    ):
-
-        position = (
-            (close - lower)
-            / (upper - lower)
-        )
+    if pd.notna(lower) and pd.notna(upper) and upper > lower:
+        position = (close - lower) / (upper - lower)
 
         if 0.30 <= position <= 0.70:
-            bb_score = 10
-
+            points = 10
         elif 0.15 <= position < 0.30:
-            bb_score = 8
-
+            points = 8
         elif 0.70 < position <= 0.85:
-            bb_score = 7
-
+            points = 7
         elif position < 0.15:
-            bb_score = 6
-
+            points = 6
         else:
-            bb_score = 3
+            points = 3
 
-    score += bb_score
+    score += points
+    details["Bollinger"] = points
 
-    details["Bollinger"] = bb_score
-
-    # ========================================================
-    # VOLUME — 10
-    # ========================================================
-
-    volume_ratio = safe_float(
-        row.get("VOLUME_RATIO")
-    )
-
-    volume_score = 0
+    # Volume : 10
+    volume_ratio = safe_float(row.get("VOLUME_RATIO"))
+    points = 0
 
     if pd.notna(volume_ratio):
-
         if volume_ratio >= 1.5:
-            volume_score = 10
-
+            points = 10
         elif volume_ratio >= 1.0:
-            volume_score = 8
-
+            points = 8
         elif volume_ratio >= 0.7:
-            volume_score = 5
-
+            points = 5
         else:
-            volume_score = 2
+            points = 2
 
-    score += volume_score
+    score += points
+    details["Volume"] = points
 
-    details["Volume"] = volume_score
-
-    # ========================================================
-    # MOMENTUM — 5
-    # ========================================================
-
-    momentum_score = 0
+    # Momentum : 5
+    points = 0
 
     if len(df) >= 21:
+        old_price = safe_float(df["Close"].iloc[-21])
 
-        old_price = safe_float(
-            df["Close"].iloc[-21]
-        )
-
-        if (
-            pd.notna(old_price)
-            and old_price > 0
-        ):
-
-            momentum = (
-                close / old_price - 1
-            ) * 100
+        if pd.notna(old_price) and old_price > 0:
+            momentum = (close / old_price - 1) * 100
 
             if momentum > 5:
-                momentum_score = 5
-
+                points = 5
             elif momentum > 0:
-                momentum_score = 3
-
+                points = 3
             else:
-                momentum_score = 1
+                points = 1
 
-    score += momentum_score
+    score += points
+    details["Momentum"] = points
 
-    details["Momentum"] = momentum_score
-
-    score = int(round(
-        min(max(score, 0), 100)
-    ))
-
-    # ========================================================
-    # SIGNAL
-    # ========================================================
+    score = int(max(0, min(100, round(score))))
 
     if score >= 80:
-
         signal = "🟢 ACHAT FORT"
-
     elif score >= 65:
-
         signal = "🟢 ACHAT"
-
     elif score >= 50:
-
         signal = "🟡 NEUTRE"
-
     elif score >= 35:
-
         signal = "🟠 VENTE PRUDENTE"
-
     else:
-
         signal = "🔴 VENTE"
 
     return score, signal, details
@@ -691,10 +311,6 @@ def calculate_score(df):
 # ============================================================
 
 def detect_trend(df):
-
-    if df.empty:
-        return "⚪ Données insuffisantes"
-
     row = df.iloc[-1]
 
     close = safe_float(row["Close"])
@@ -702,129 +318,56 @@ def detect_trend(df):
     sma50 = safe_float(row.get("SMA_50"))
     sma200 = safe_float(row.get("SMA_200"))
 
-    if any(
-        pd.isna(x)
-        for x in [close, sma20, sma50, sma200]
-    ):
+    if any(pd.isna(x) for x in [close, sma20, sma50, sma200]):
         return "⚪ Données insuffisantes"
 
     if close > sma20 > sma50 > sma200:
-
         return "🟢 Tendance fortement haussière"
 
     if close > sma50 > sma200:
-
         return "🟢 Tendance haussière"
 
     if close > sma200 and close < sma50:
-
         return "🟡 Correction dans tendance haussière"
 
     if close < sma200 and close > sma50:
-
         return "🟠 Reprise potentielle"
 
     if close < sma50 < sma200:
-
         return "🔴 Tendance baissière"
 
     return "🟡 Tendance neutre"
 
 
 # ============================================================
-# METRIQUES DE PERFORMANCE
+# PERFORMANCE
 # ============================================================
 
 def calculate_performance(equity):
-    """
-    Calcule les principales métriques de performance.
-    """
-
-    if equity.empty:
-        return {}
-
     equity = equity.dropna()
 
     if len(equity) < 2:
         return {}
 
-    start_value = safe_float(
-        equity.iloc[0]
-    )
+    start = safe_float(equity.iloc[0])
+    end = safe_float(equity.iloc[-1])
 
-    end_value = safe_float(
-        equity.iloc[-1]
-    )
+    total_return = (end / start - 1) * 100
 
-    total_return = (
-        end_value / start_value - 1
-    ) * 100
+    days = max((equity.index[-1] - equity.index[0]).days, 1)
+    years = days / 365.25
 
-    # --------------------------------------------------------
-    # Durée
-    # --------------------------------------------------------
-
-    days = (
-        equity.index[-1]
-        - equity.index[0]
-    ).days
-
-    years = max(
-        days / 365.25,
-        1 / 365.25,
-    )
-
-    # --------------------------------------------------------
-    # CAGR
-    # --------------------------------------------------------
-
-    if start_value > 0:
-
-        cagr = (
-            (end_value / start_value)
-            ** (1 / years)
-            - 1
-        ) * 100
-
-    else:
-
-        cagr = np.nan
-
-    # --------------------------------------------------------
-    # Rendements journaliers
-    # --------------------------------------------------------
+    cagr = ((end / start) ** (1 / years) - 1) * 100
 
     returns = equity.pct_change().dropna()
 
-    # --------------------------------------------------------
-    # Sharpe
-    # --------------------------------------------------------
-
-    if (
-        len(returns) > 1
-        and returns.std() != 0
-    ):
-
-        sharpe = (
-            returns.mean()
-            / returns.std()
-            * np.sqrt(TRADING_DAYS)
-        )
-
+    if len(returns) > 1 and returns.std() != 0:
+        sharpe = returns.mean() / returns.std() * np.sqrt(TRADING_DAYS)
     else:
-
         sharpe = np.nan
 
-    # --------------------------------------------------------
-    # Drawdown
-    # --------------------------------------------------------
-
     running_max = equity.cummax()
-
-    drawdown = (
-        equity / running_max - 1
-    ) * 100
-
+    drawdown = (equity / running_max - 1) * 100
     max_drawdown = drawdown.min()
 
     return {
@@ -841,87 +384,42 @@ def calculate_performance(equity):
 
 def backtest_strategy(
     df,
-    initial_capital=10000,
-    transaction_cost=0.001,
+    initial_capital,
+    transaction_cost,
+    threshold,
 ):
-    """
-    Backtest simple.
-
-    Règle :
-
-    Position = 1 si score >= seuil.
-    Position = 0 sinon.
-
-    Pour éviter le look-ahead bias, la position
-    du jour suivant est utilisée pour le rendement.
-    """
-
     data = df.copy()
 
     if data.empty:
         return pd.DataFrame(), {}
 
-    # --------------------------------------------------------
-    # Calcul du score historique
-    # --------------------------------------------------------
-
+    # Calcul historique du score
     scores = []
 
     for i in range(len(data)):
-
         subset = data.iloc[:i + 1]
-
-        score, _, _ = calculate_score(
-            subset
-        )
-
+        score, _, _ = calculate_score(subset)
         scores.append(score)
 
     data["SCORE"] = scores
-
-    # --------------------------------------------------------
-    # Position
-    # --------------------------------------------------------
-
-    threshold = st.session_state.get(
-        "backtest_threshold",
-        65,
-    )
 
     data["POSITION"] = (
         data["SCORE"] >= threshold
     ).astype(int)
 
-    # --------------------------------------------------------
-    # Position décalée
-    # --------------------------------------------------------
-
+    # Décalage pour éviter d'utiliser le signal du même jour
     data["POSITION_LAG"] = (
         data["POSITION"]
         .shift(1)
         .fillna(0)
     )
 
-    # --------------------------------------------------------
-    # Rendement marché
-    # --------------------------------------------------------
-
-    data["MARKET_RETURN"] = (
-        data["Close"].pct_change()
-    )
-
-    # --------------------------------------------------------
-    # Rendement stratégie
-    # --------------------------------------------------------
+    data["MARKET_RETURN"] = data["Close"].pct_change()
 
     data["STRATEGY_RETURN"] = (
         data["POSITION_LAG"]
         * data["MARKET_RETURN"]
     )
-
-    # --------------------------------------------------------
-    # Frais de transaction
-    # --------------------------------------------------------
 
     position_change = (
         data["POSITION_LAG"]
@@ -940,56 +438,33 @@ def backtest_strategy(
         - data["COST"]
     )
 
-    # --------------------------------------------------------
-    # Equity
-    # --------------------------------------------------------
-
     data["EQUITY"] = (
         initial_capital
         * (
-            1
-            + data["STRATEGY_RETURN_NET"]
+            1 + data["STRATEGY_RETURN_NET"].fillna(0)
         ).cumprod()
     )
-
-    # --------------------------------------------------------
-    # Buy & Hold
-    # --------------------------------------------------------
 
     data["BUY_HOLD"] = (
         initial_capital
         * (
-            1
-            + data["MARKET_RETURN"].fillna(0)
+            1 + data["MARKET_RETURN"].fillna(0)
         ).cumprod()
     )
 
-    # --------------------------------------------------------
-    # Performance
-    # --------------------------------------------------------
-
-    strategy_metrics = calculate_performance(
-        data["EQUITY"]
-    )
-
-    buy_hold_metrics = calculate_performance(
-        data["BUY_HOLD"]
-    )
-
     metrics = {
-        "strategy": strategy_metrics,
-        "buy_hold": buy_hold_metrics,
+        "strategy": calculate_performance(data["EQUITY"]),
+        "buy_hold": calculate_performance(data["BUY_HOLD"]),
     }
 
     return data, metrics
 
 
 # ============================================================
-# GRAPHIQUE PRINCIPAL
+# GRAPHIQUES
 # ============================================================
 
-def create_price_chart(df, ticker):
-
+def price_chart(df, ticker):
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -997,10 +472,6 @@ def create_price_chart(df, ticker):
         vertical_spacing=0.04,
         row_heights=[0.75, 0.25],
     )
-
-    # --------------------------------------------------------
-    # Chandeliers
-    # --------------------------------------------------------
 
     fig.add_trace(
         go.Candlestick(
@@ -1015,90 +486,27 @@ def create_price_chart(df, ticker):
         col=1,
     )
 
-    # --------------------------------------------------------
-    # SMA20
-    # --------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["SMA_20"],
-            name="SMA 20",
-            line=dict(width=1),
-        ),
-        row=1,
-        col=1,
-    )
-
-    # --------------------------------------------------------
-    # SMA50
-    # --------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["SMA_50"],
-            name="SMA 50",
-            line=dict(width=2),
-        ),
-        row=1,
-        col=1,
-    )
-
-    # --------------------------------------------------------
-    # SMA200
-    # --------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["SMA_200"],
-            name="SMA 200",
-            line=dict(width=2),
-        ),
-        row=1,
-        col=1,
-    )
-
-    # --------------------------------------------------------
-    # Bollinger haut
-    # --------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_UPPER"],
-            name="BB Haut",
-            line=dict(
-                width=1,
-                dash="dot",
-            ),
-        ),
-        row=1,
-        col=1,
-    )
-
-    # --------------------------------------------------------
-    # Bollinger bas
-    # --------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_LOWER"],
-            name="BB Bas",
-            line=dict(
-                width=1,
-                dash="dot",
-            ),
-        ),
-        row=1,
-        col=1,
-    )
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
+    for column, name, width in [
+        ("SMA_20", "SMA 20", 1),
+        ("SMA_50", "SMA 50", 2),
+        ("SMA_200", "SMA 200", 2),
+        ("BB_UPPER", "BB Haut", 1),
+        ("BB_LOWER", "BB Bas", 1),
+    ]:
+        if column in df:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df[column],
+                    name=name,
+                    line=dict(
+                        width=width,
+                        dash="dot" if "BB_" in column else "solid",
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
 
     fig.add_trace(
         go.Bar(
@@ -1126,22 +534,12 @@ def create_price_chart(df, ticker):
         height=700,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            y=1.02,
-            x=0,
-        ),
     )
 
     return fig
 
 
-# ============================================================
-# RSI
-# ============================================================
-
-def create_rsi_chart(df):
-
+def rsi_chart(df):
     fig = go.Figure()
 
     fig.add_trace(
@@ -1153,42 +551,28 @@ def create_rsi_chart(df):
         )
     )
 
-    fig.add_hline(
-        y=70,
-        line_dash="dash",
-        annotation_text="70",
-    )
-
-    fig.add_hline(
-        y=50,
-        line_dash="dot",
-        annotation_text="50",
-    )
-
-    fig.add_hline(
-        y=30,
-        line_dash="dash",
-        annotation_text="30",
-    )
+    for level, text, dash in [
+        (70, "Surachat", "dash"),
+        (50, "Neutre", "dot"),
+        (30, "Survente", "dash"),
+    ]:
+        fig.add_hline(
+            y=level,
+            line_dash=dash,
+            annotation_text=text,
+        )
 
     fig.update_layout(
         title="RSI 14",
         height=350,
-        yaxis=dict(
-            range=[0, 100]
-        ),
+        yaxis=dict(range=[0, 100]),
         hovermode="x unified",
     )
 
     return fig
 
 
-# ============================================================
-# MACD
-# ============================================================
-
-def create_macd_chart(df):
-
+def macd_chart(df):
     fig = go.Figure()
 
     fig.add_trace(
@@ -1215,10 +599,7 @@ def create_macd_chart(df):
         name="Histogramme",
     )
 
-    fig.add_hline(
-        y=0,
-        line_dash="dot",
-    )
+    fig.add_hline(y=0, line_dash="dot")
 
     fig.update_layout(
         title="MACD 12 / 26 / 9",
@@ -1229,21 +610,51 @@ def create_macd_chart(df):
     return fig
 
 
-# ============================================================
-# GRAPHIQUE BACKTEST
-# ============================================================
-
-def create_backtest_chart(
-    backtest,
-    ticker,
-):
-
+def bollinger_chart(df):
     fig = go.Figure()
 
     fig.add_trace(
         go.Scatter(
-            x=backtest.index,
-            y=backtest["EQUITY"],
+            x=df.index,
+            y=df["Close"],
+            name="Cours",
+            line=dict(width=2),
+        )
+    )
+
+    for column, name in [
+        ("BB_UPPER", "BB Haut"),
+        ("BB_MIDDLE", "BB Moyenne"),
+        ("BB_LOWER", "BB Bas"),
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df[column],
+                name=name,
+                line=dict(
+                    width=1,
+                    dash="dot" if column != "BB_MIDDLE" else "solid",
+                ),
+            )
+        )
+
+    fig.update_layout(
+        title="Bandes de Bollinger",
+        height=450,
+        hovermode="x unified",
+    )
+
+    return fig
+
+
+def backtest_chart(bt, ticker):
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=bt.index,
+            y=bt["EQUITY"],
             name="Stratégie",
             line=dict(width=3),
         )
@@ -1251,18 +662,15 @@ def create_backtest_chart(
 
     fig.add_trace(
         go.Scatter(
-            x=backtest.index,
-            y=backtest["BUY_HOLD"],
+            x=bt.index,
+            y=bt["BUY_HOLD"],
             name="Buy & Hold",
-            line=dict(
-                width=2,
-                dash="dash",
-            ),
+            line=dict(width=2, dash="dash"),
         )
     )
 
     fig.update_layout(
-        title=f"{ticker} — Backtest",
+        title=f"{ticker} — Stratégie vs Buy & Hold",
         xaxis_title="Date",
         yaxis_title="Capital",
         height=500,
@@ -1273,94 +681,65 @@ def create_backtest_chart(
 
 
 # ============================================================
-# EXPORT EXCEL
+# EXPORT
 # ============================================================
 
-def dataframe_to_excel(df):
-
+def to_excel(df):
     output = io.BytesIO()
 
     with pd.ExcelWriter(
         output,
         engine="openpyxl",
     ) as writer:
-
         df.to_excel(
             writer,
-            index=True,
-            sheet_name="Analyse",
+            index=False,
+            sheet_name="Classement",
         )
 
     output.seek(0)
-
-    return output
+    return output.getvalue()
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("⚙️ Stock Analyzer V2")
-
-st.sidebar.markdown(
-    "### Actions à analyser"
-)
+st.sidebar.title("⚙️ Paramètres")
 
 ticker_input = st.sidebar.text_area(
-    "Tickers",
+    "Actions à analyser",
     value=DEFAULT_TICKERS,
-    height=120,
-    help=(
-        "Séparez les tickers par des virgules."
-    ),
+    height=130,
 )
 
 tickers = [
     ticker.strip().upper()
-    for ticker in ticker_input.replace(
-        "\n",
-        ","
-    ).split(",")
+    for ticker in ticker_input.replace("\n", ",").split(",")
     if ticker.strip()
 ]
 
-st.sidebar.markdown("---")
-
 period = st.sidebar.selectbox(
     "Historique",
-    [
-        "6mo",
-        "1y",
-        "2y",
-        "5y",
-        "10y",
-        "max",
-    ],
+    ["6mo", "1y", "2y", "5y", "10y", "max"],
     index=3,
 )
 
 interval = st.sidebar.selectbox(
     "Intervalle",
-    [
-        "1d",
-        "1wk",
-        "1mo",
-    ],
+    ["1d", "1wk", "1mo"],
     index=0,
 )
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("Backtest")
 
-st.sidebar.subheader(
-    "Paramètres backtest"
-)
-
-backtest_threshold = st.sidebar.slider(
+threshold = st.sidebar.slider(
     "Seuil d'entrée",
-    min_value=40,
-    max_value=90,
-    value=65,
-    step=5,
+    40,
+    90,
+    65,
+    5,
 )
 
 transaction_cost = st.sidebar.number_input(
@@ -1379,81 +758,30 @@ initial_capital = st.sidebar.number_input(
     step=1_000.0,
 )
 
-st.session_state[
-    "backtest_threshold"
-] = backtest_threshold
-
-st.sidebar.markdown("---")
-
-st.sidebar.info(
-    """
-    **Score technique**
-
-    Tendance : 40 points
-
-    RSI : 20 points
-
-    MACD : 15 points
-
-    Bollinger : 10 points
-
-    Volume : 10 points
-
-    Momentum : 5 points
-    """
-)
-
 
 # ============================================================
 # TITRE
 # ============================================================
 
-st.markdown(
-    '<div class="title">📈 Stock Analyzer V2</div>',
-    unsafe_allow_html=True,
-)
+st.title("📈 Stock Analyzer V2")
 
 st.markdown(
-    """
-    <div class="subtitle">
-    Analyse technique • Scanner • Score • Backtest • Performance
-    </div>
-    """,
-    unsafe_allow_html=True,
+    "Analyse technique • Scanner • Score • Backtest • Performance"
 )
 
 
 # ============================================================
-# VERIFICATION
+# ANALYSE
 # ============================================================
 
 if not tickers:
-
-    st.warning(
-        "Saisissez au moins un ticker."
-    )
-
+    st.warning("Saisissez au moins un ticker.")
     st.stop()
 
-
-# ============================================================
-# STOCKAGE
-# ============================================================
-
-all_results = []
-
 all_data = {}
+results = []
 
-backtest_results = {}
-
-
-# ============================================================
-# TELECHARGEMENT ET ANALYSE
-# ============================================================
-
-with st.spinner(
-    "Téléchargement et analyse des actions..."
-):
+with st.spinner("Téléchargement et calcul des indicateurs..."):
 
     for ticker in tickers:
 
@@ -1466,179 +794,85 @@ with st.spinner(
         if raw.empty:
             continue
 
-        df = calculate_indicators(
-            raw
-        )
+        df = calculate_indicators(raw)
 
         if len(df) < 50:
             continue
 
         all_data[ticker] = df
 
-        score, signal, details = (
-            calculate_score(df)
-        )
-
+        score, signal, details = calculate_score(df)
         trend = detect_trend(df)
-
         row = df.iloc[-1]
 
-        close = safe_float(
-            row["Close"]
-        )
+        close = safe_float(row["Close"])
 
-        rsi = safe_float(
-            row.get("RSI")
-        )
-
-        sma50 = safe_float(
-            row.get("SMA_50")
-        )
-
-        sma200 = safe_float(
-            row.get("SMA_200")
-        )
-
-        macd = safe_float(
-            row.get("MACD")
-        )
-
-        volatility = safe_float(
-            row.get("VOLATILITY_20")
-        )
-
-        volume_ratio = safe_float(
-            row.get("VOLUME_RATIO")
-        )
+        one_month_return = np.nan
 
         if len(df) >= 21:
+            old = safe_float(df["Close"].iloc[-21])
 
-            price_1m = safe_float(
-                df["Close"].iloc[-21]
-            )
-
-            if (
-                pd.notna(price_1m)
-                and price_1m != 0
-            ):
-
-                return_1m = (
-                    close / price_1m
-                    - 1
+            if pd.notna(old) and old != 0:
+                one_month_return = (
+                    close / old - 1
                 ) * 100
 
-            else:
-
-                return_1m = np.nan
-
-        else:
-
-            return_1m = np.nan
-
-        all_results.append(
+        results.append(
             {
                 "Ticker": ticker,
                 "Prix": close,
-                "RSI": rsi,
-                "SMA 50": sma50,
-                "SMA 200": sma200,
-                "MACD": macd,
-                "Volatilité 20j": volatility,
-                "Volume / Moy.20": volume_ratio,
-                "Perf. 1 mois": return_1m,
+                "RSI": safe_float(row.get("RSI")),
+                "SMA 50": safe_float(row.get("SMA_50")),
+                "SMA 200": safe_float(row.get("SMA_200")),
+                "MACD": safe_float(row.get("MACD")),
+                "Volatilité 20j": safe_float(row.get("VOLATILITY_20")),
+                "Volume / Moy.20": safe_float(row.get("VOLUME_RATIO")),
+                "Perf. 1 mois": one_month_return,
                 "Score": score,
                 "Signal": signal,
                 "Tendance": trend,
             }
         )
 
-
-# ============================================================
-# VERIFICATION RESULTATS
-# ============================================================
-
-if not all_results:
-
+if not results:
     st.error(
-        "Aucune donnée exploitable n'a été récupérée."
+        "Aucune donnée exploitable. Vérifiez les tickers et les dépendances."
     )
-
     st.stop()
 
-
-results_df = pd.DataFrame(
-    all_results
-)
-
-results_df = results_df.sort_values(
-    "Score",
-    ascending=False,
-).reset_index(drop=True)
+results_df = pd.DataFrame(results)
+results_df = results_df.sort_values("Score", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
-# KPI GLOBALS
+# VUE GENERALE
 # ============================================================
 
-st.subheader(
-    "🏆 Vue d'ensemble"
-)
+st.header("🏆 Vue d'ensemble")
 
 best = results_df.iloc[0]
 
-col1, col2, col3, col4, col5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 
-with col1:
+with c1:
+    st.metric("Actions analysées", len(results_df))
 
+with c2:
     st.metric(
-        "Actions analysées",
-        len(results_df),
-    )
-
-with col2:
-
-    st.metric(
-        "Meilleur score",
+        "Meilleure action",
         f"{best['Ticker']} — {int(best['Score'])}/100",
     )
 
-with col3:
-
-    buy_count = results_df[
-        results_df["Score"] >= 65
-    ].shape[0]
-
+with c3:
     st.metric(
-        "Signaux favorables",
-        buy_count,
+        "Signaux ≥ 65",
+        int((results_df["Score"] >= 65).sum()),
     )
 
-with col4:
-
-    neutral_count = results_df[
-        (
-            results_df["Score"] >= 50
-        )
-        &
-        (
-            results_df["Score"] < 65
-        )
-    ].shape[0]
-
+with c4:
     st.metric(
-        "Neutres",
-        neutral_count,
-    )
-
-with col5:
-
-    sell_count = results_df[
-        results_df["Score"] < 50
-    ].shape[0]
-
-    st.metric(
-        "Signaux faibles",
-        sell_count,
+        "Signaux < 50",
+        int((results_df["Score"] < 50).sum()),
     )
 
 
@@ -1646,414 +880,145 @@ with col5:
 # CLASSEMENT
 # ============================================================
 
-st.markdown("---")
-
-st.header(
-    "🏆 Classement technique"
-)
-
-display_ranking = results_df.copy()
-
-numeric_columns = [
-    "Prix",
-    "RSI",
-    "SMA 50",
-    "SMA 200",
-    "MACD",
-    "Volatilité 20j",
-    "Volume / Moy.20",
-    "Perf. 1 mois",
-    "Score",
-]
-
-for col in numeric_columns:
-
-    if col in display_ranking.columns:
-
-        display_ranking[col] = (
-            display_ranking[col]
-            .round(2)
-        )
+st.subheader("🏆 Classement technique")
 
 st.dataframe(
-    display_ranking,
+    results_df.round(2),
     use_container_width=True,
     hide_index=True,
 )
 
+fig = go.Figure()
 
-# ============================================================
-# GRAPHIQUE CLASSEMENT
-# ============================================================
-
-fig_ranking = go.Figure()
-
-fig_ranking.add_bar(
+fig.add_bar(
     x=results_df["Ticker"],
     y=results_df["Score"],
     text=results_df["Score"],
     textposition="auto",
 )
 
-fig_ranking.update_layout(
-    title="Score technique par action",
-    yaxis_title="Score / 100",
-    xaxis_title="Action",
-    yaxis=dict(
-        range=[0, 100]
-    ),
-    height=450,
+fig.update_layout(
+    title="Score technique",
+    yaxis=dict(range=[0, 100]),
+    height=400,
 )
 
-st.plotly_chart(
-    fig_ranking,
-    use_container_width=True,
-)
+st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
-# SELECTION ACTION
+# ANALYSE DETAILLEE
 # ============================================================
 
 st.markdown("---")
+st.header("🔎 Analyse détaillée")
 
-st.header(
-    "🔎 Analyse détaillée"
-)
-
-selected_ticker = st.selectbox(
-    "Choisir une action",
+selected = st.selectbox(
+    "Action",
     list(all_data.keys()),
 )
 
+df = all_data[selected]
 
-df = all_data[
-    selected_ticker
-]
-
-score, signal, details = (
-    calculate_score(df)
-)
-
+score, signal, details = calculate_score(df)
 trend = detect_trend(df)
-
 row = df.iloc[-1]
 
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-# ============================================================
-# KPI ACTION
-# ============================================================
+with c1:
+    st.metric("Prix", fmt(row["Close"]))
 
-st.subheader(
-    f"{selected_ticker}"
-)
+with c2:
+    st.metric("RSI 14", fmt(row["RSI"], 1))
 
-col1, col2, col3, col4, col5, col6 = (
-    st.columns(6)
-)
+with c3:
+    st.metric("SMA 50", fmt(row["SMA_50"]))
 
-with col1:
+with c4:
+    st.metric("SMA 200", fmt(row["SMA_200"]))
 
-    st.metric(
-        "Prix",
-        format_price(
-            row["Close"]
-        ),
-    )
+with c5:
+    st.metric("Score", f"{score}/100")
 
-with col2:
+with c6:
+    st.metric("Signal", signal)
 
-    st.metric(
-        "RSI 14",
-        format_price(
-            row["RSI"]
-        ),
-    )
-
-with col3:
-
-    st.metric(
-        "SMA 50",
-        format_price(
-            row["SMA_50"]
-        ),
-    )
-
-with col4:
-
-    st.metric(
-        "SMA 200",
-        format_price(
-            row["SMA_200"]
-        ),
-    )
-
-with col5:
-
-    st.metric(
-        "Score",
-        f"{score}/100",
-    )
-
-with col6:
-
-    st.metric(
-        "Signal",
-        signal,
-    )
-
-
-# ============================================================
-# TENDANCE
-# ============================================================
-
-st.info(
-    f"**Tendance détectée :** {trend}"
-)
+st.info(f"**Tendance :** {trend}")
 
 st.progress(
     score / 100,
     text=f"Score technique : {score}/100",
 )
 
+st.subheader("Décomposition du score")
 
-# ============================================================
-# SCORE DETAIL
-# ============================================================
-
-st.subheader(
-    "🎯 Décomposition du score"
-)
-
-score_detail = pd.DataFrame(
+detail_df = pd.DataFrame(
     {
-        "Indicateur": list(
-            details.keys()
-        ),
-        "Points": list(
-            details.values()
-        ),
+        "Indicateur": list(details.keys()),
+        "Points": list(details.values()),
     }
 )
 
 st.dataframe(
-    score_detail,
+    detail_df,
     use_container_width=True,
     hide_index=True,
 )
 
-
-# ============================================================
-# GRAPHIQUE PRIX
-# ============================================================
-
-st.subheader(
-    "📈 Cours et indicateurs"
-)
+st.subheader("📈 Cours")
 
 st.plotly_chart(
-    create_price_chart(
-        df,
-        selected_ticker,
-    ),
+    price_chart(df, selected),
     use_container_width=True,
 )
 
 
 # ============================================================
-# ONGLETS
+# INDICATEURS
 # ============================================================
 
-tab_rsi, tab_macd, tab_bollinger, tab_data = (
-    st.tabs(
-        [
-            "RSI",
-            "MACD",
-            "Bollinger / Volatilité",
-            "Données",
-        ]
-    )
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["RSI", "MACD", "Bollinger", "Données"]
 )
 
-
-# ============================================================
-# RSI
-# ============================================================
-
-with tab_rsi:
-
+with tab1:
     st.plotly_chart(
-        create_rsi_chart(df),
+        rsi_chart(df),
         use_container_width=True,
     )
 
-    current_rsi = safe_float(
-        row["RSI"]
-    )
-
-    if pd.notna(current_rsi):
-
-        if current_rsi < 30:
-
-            st.success(
-                f"RSI = {current_rsi:.1f} : "
-                "zone de survente."
-            )
-
-        elif current_rsi > 70:
-
-            st.warning(
-                f"RSI = {current_rsi:.1f} : "
-                "zone de surachat."
-            )
-
-        else:
-
-            st.info(
-                f"RSI = {current_rsi:.1f} : "
-                "zone intermédiaire."
-            )
-
-
-# ============================================================
-# MACD
-# ============================================================
-
-with tab_macd:
-
+with tab2:
     st.plotly_chart(
-        create_macd_chart(df),
+        macd_chart(df),
         use_container_width=True,
     )
 
-    macd_value = safe_float(
-        row.get("MACD")
-    )
-
-    signal_value = safe_float(
-        row.get("MACD_SIGNAL")
-    )
-
-    if (
-        pd.notna(macd_value)
-        and pd.notna(signal_value)
-    ):
-
-        if macd_value > signal_value:
-
-            st.success(
-                "MACD au-dessus de sa ligne de signal."
-            )
-
-        else:
-
-            st.warning(
-                "MACD sous sa ligne de signal."
-            )
-
-
-# ============================================================
-# BOLLINGER
-# ============================================================
-
-with tab_bollinger:
-
-    fig_bb = go.Figure()
-
-    fig_bb.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["Close"],
-            name="Cours",
-            line=dict(width=2),
-        )
-    )
-
-    fig_bb.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_UPPER"],
-            name="Bande supérieure",
-            line=dict(
-                width=1,
-                dash="dot",
-            ),
-        )
-    )
-
-    fig_bb.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_MIDDLE"],
-            name="Moyenne",
-            line=dict(width=1),
-        )
-    )
-
-    fig_bb.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["BB_LOWER"],
-            name="Bande inférieure",
-            line=dict(
-                width=1,
-                dash="dot",
-            ),
-        )
-    )
-
-    fig_bb.update_layout(
-        title="Bandes de Bollinger",
-        height=450,
-        hovermode="x unified",
-    )
-
+with tab3:
     st.plotly_chart(
-        fig_bb,
+        bollinger_chart(df),
         use_container_width=True,
     )
 
-    vol = safe_float(
-        row.get("VOLATILITY_20")
-    )
+    c1, c2 = st.columns(2)
 
-    atr = safe_float(
-        row.get("ATR")
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
+    with c1:
         st.metric(
             "Volatilité annualisée 20j",
-            (
-                f"{vol:.2f}%"
-                if pd.notna(vol)
-                else "N/A"
-            ),
+            fmt(row.get("VOLATILITY_20"), 2) + "%"
+            if pd.notna(row.get("VOLATILITY_20"))
+            else "N/A",
         )
 
-    with col2:
-
+    with c2:
         st.metric(
             "ATR 14",
-            (
-                f"{atr:.2f}"
-                if pd.notna(atr)
-                else "N/A"
-            ),
+            fmt(row.get("ATR"), 2),
         )
 
-
-# ============================================================
-# DONNEES
-# ============================================================
-
-with tab_data:
-
+with tab4:
     st.dataframe(
-        df.tail(200),
+        df.tail(250),
         use_container_width=True,
     )
 
@@ -2063,179 +1028,81 @@ with tab_data:
 # ============================================================
 
 st.markdown("---")
+st.header("🧪 Backtest")
 
-st.header(
-    "🧪 Backtest de la stratégie"
-)
-
-st.markdown(
+st.write(
     f"""
-    **Règle de simulation :**
-
-    Une position est prise lorsque le score technique
-    atteint au moins **{backtest_threshold}/100**.
-
-    Le signal est décalé d'une période afin de limiter
-    le biais d'anticipation.
-
-    Les frais de transaction simulés sont de
-    **{transaction_cost:.2f}%**.
+    La stratégie prend une position lorsque le score atteint
+    **{threshold}/100**. Le signal est décalé d'une période
+    pour éviter d'utiliser directement l'information du jour.
+    Frais simulés : **{transaction_cost:.2f}%** par changement de position.
     """
 )
 
-run_backtest = st.button(
-    "▶️ Lancer le backtest",
-    type="primary",
-)
+if st.button("▶️ Lancer le backtest", type="primary"):
 
-
-if run_backtest:
-
-    with st.spinner(
-        "Calcul du backtest..."
-    ):
+    with st.spinner("Calcul du backtest..."):
 
         bt, metrics = backtest_strategy(
             df,
             initial_capital,
             transaction_cost / 100,
+            threshold,
         )
 
     if bt.empty:
-
-        st.error(
-            "Impossible d'effectuer le backtest."
-        )
-
+        st.error("Backtest impossible.")
     else:
 
-        backtest_results[
-            selected_ticker
-        ] = bt
+        strategy = metrics["strategy"]
+        buy_hold = metrics["buy_hold"]
 
-        strategy = metrics.get(
-            "strategy",
-            {}
-        )
+        c1, c2, c3, c4 = st.columns(4)
 
-        buy_hold = metrics.get(
-            "buy_hold",
-            {}
-        )
-
-        st.subheader(
-            "📊 Résultats"
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-
-            value = strategy.get(
-                "Total Return",
-                np.nan,
-            )
-
+        with c1:
             st.metric(
                 "Stratégie",
-                (
-                    f"{value:.2f}%"
-                    if pd.notna(value)
-                    else "N/A"
-                ),
+                fmt(strategy.get("Total Return")) + "%",
             )
 
-        with col2:
-
-            value = buy_hold.get(
-                "Total Return",
-                np.nan,
-            )
-
+        with c2:
             st.metric(
                 "Buy & Hold",
-                (
-                    f"{value:.2f}%"
-                    if pd.notna(value)
-                    else "N/A"
-                ),
+                fmt(buy_hold.get("Total Return")) + "%",
             )
 
-        with col3:
-
-            value = strategy.get(
-                "CAGR",
-                np.nan,
-            )
-
+        with c3:
             st.metric(
                 "CAGR",
-                (
-                    f"{value:.2f}%"
-                    if pd.notna(value)
-                    else "N/A"
-                ),
+                fmt(strategy.get("CAGR")) + "%",
             )
 
-        with col4:
-
-            value = strategy.get(
-                "Sharpe",
-                np.nan,
-            )
-
+        with c4:
             st.metric(
                 "Sharpe",
-                (
-                    f"{value:.2f}"
-                    if pd.notna(value)
-                    else "N/A"
-                ),
+                fmt(strategy.get("Sharpe")),
             )
 
-        col1, col2, col3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-        with col1:
-
-            value = strategy.get(
-                "Max Drawdown",
-                np.nan,
-            )
-
+        with c1:
             st.metric(
-                "Drawdown maximum",
-                (
-                    f"{value:.2f}%"
-                    if pd.notna(value)
-                    else "N/A"
-                ),
+                "Drawdown max",
+                fmt(strategy.get("Max Drawdown")) + "%",
             )
 
-        with col2:
-
-            value = (
-                strategy.get(
-                    "Total Return",
-                    np.nan,
-                )
-                -
-                buy_hold.get(
-                    "Total Return",
-                    np.nan,
-                )
+        with c2:
+            outperformance = (
+                strategy.get("Total Return", np.nan)
+                - buy_hold.get("Total Return", np.nan)
             )
 
             st.metric(
                 "Surperformance",
-                (
-                    f"{value:.2f}%"
-                    if pd.notna(value)
-                    else "N/A"
-                ),
+                fmt(outperformance) + "%",
             )
 
-        with col3:
-
+        with c3:
             trades = (
                 bt["POSITION"]
                 .diff()
@@ -2245,35 +1112,18 @@ if run_backtest:
             )
 
             st.metric(
-                "Nombre approximatif de trades",
-                f"{int(trades)}",
+                "Trades",
+                int(trades),
             )
 
-        # ----------------------------------------------------
-        # Graphique
-        # ----------------------------------------------------
-
         st.plotly_chart(
-            create_backtest_chart(
-                bt,
-                selected_ticker,
-            ),
+            backtest_chart(bt, selected),
             use_container_width=True,
         )
 
-        # ----------------------------------------------------
-        # Courbe du drawdown
-        # ----------------------------------------------------
-
-        running_max = (
-            bt["EQUITY"]
-            .cummax()
-        )
-
+        running_max = bt["EQUITY"].cummax()
         drawdown = (
-            bt["EQUITY"]
-            / running_max
-            - 1
+            bt["EQUITY"] / running_max - 1
         ) * 100
 
         fig_dd = go.Figure()
@@ -2289,8 +1139,8 @@ if run_backtest:
         )
 
         fig_dd.update_layout(
-            title="Drawdown de la stratégie",
-            yaxis_title="Drawdown (%)",
+            title="Drawdown",
+            yaxis_title="%",
             height=350,
         )
 
@@ -2299,26 +1149,9 @@ if run_backtest:
             use_container_width=True,
         )
 
-        # ----------------------------------------------------
-        # Tableau
-        # ----------------------------------------------------
-
-        with st.expander(
-            "Voir les données du backtest"
-        ):
-
+        with st.expander("Données du backtest"):
             st.dataframe(
-                bt[
-                    [
-                        "Close",
-                        "SCORE",
-                        "POSITION",
-                        "MARKET_RETURN",
-                        "STRATEGY_RETURN_NET",
-                        "EQUITY",
-                        "BUY_HOLD",
-                    ]
-                ].tail(300),
+                bt.tail(300),
                 use_container_width=True,
             )
 
@@ -2328,91 +1161,28 @@ if run_backtest:
 # ============================================================
 
 st.markdown("---")
+st.header("📥 Export")
 
-st.header(
-    "📥 Export"
-)
+c1, c2 = st.columns(2)
 
-col1, col2 = st.columns(2)
-
-with col1:
-
-    csv_data = results_df.to_csv(
-        index=False
-    ).encode(
-        "utf-8"
-    )
-
+with c1:
     st.download_button(
-        label="📄 Télécharger CSV",
-        data=csv_data,
+        "📄 Télécharger CSV",
+        data=results_df.to_csv(index=False).encode("utf-8"),
         file_name="stock_analysis.csv",
         mime="text/csv",
     )
 
-with col2:
-
-    excel_data = dataframe_to_excel(
-        results_df
-    )
-
+with c2:
     st.download_button(
-        label="📊 Télécharger Excel",
-        data=excel_data,
+        "📊 Télécharger Excel",
+        data=to_excel(results_df),
         file_name="stock_analysis.xlsx",
         mime=(
-            "application/"
-            "vnd.openxmlformats-officedocument."
+            "application/vnd.openxmlformats-officedocument."
             "spreadsheetml.sheet"
         ),
     )
-
-
-# ============================================================
-# INTERPRETATION
-# ============================================================
-
-st.markdown("---")
-
-st.header(
-    "ℹ️ Interprétation"
-)
-
-st.markdown(
-    """
-    ### Score
-
-    Le score est un indicateur synthétique permettant de
-    comparer les actions entre elles.
-
-    **80–100 :** configuration technique très favorable
-
-    **65–79 :** configuration favorable
-
-    **50–64 :** configuration neutre
-
-    **35–49 :** configuration défavorable
-
-    **0–34 :** configuration très défavorable
-
-    ### Backtest
-
-    Le backtest permet de vérifier comment une règle donnée
-    aurait fonctionné historiquement.
-
-    Il faut notamment regarder :
-
-    - le rendement total ;
-    - le CAGR ;
-    - le Sharpe Ratio ;
-    - le drawdown maximum ;
-    - le nombre de trades ;
-    - la comparaison avec Buy & Hold.
-
-    Un rendement historique élevé ne signifie pas que la
-    stratégie fonctionnera nécessairement dans le futur.
-    """
-)
 
 
 # ============================================================
@@ -2422,12 +1192,6 @@ st.markdown(
 st.markdown("---")
 
 st.caption(
-    """
-    Stock Analyzer V2 • Python / Streamlit / Plotly / Yahoo Finance
-
-    Outil d'analyse et de simulation uniquement.
-    Les informations affichées ne constituent pas un conseil
-    en investissement.
-    """
+    "Stock Analyzer V2 — outil d'analyse et de simulation. "
+    "Les résultats historiques ne garantissent pas les résultats futurs."
 )
-```
