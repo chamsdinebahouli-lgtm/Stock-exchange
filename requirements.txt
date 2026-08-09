@@ -1,6 +1,6 @@
 yfinance
 pandas
 numpy
-ta
+pandas-ta-classic
 plotly
 openpyxl
