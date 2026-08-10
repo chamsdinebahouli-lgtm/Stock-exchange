@@ -1,8 +1,17 @@
 """
-Stock Analyzer V3
+Stock Analyzer V4
 Application Streamlit d'analyse technique et de backtest.
 
-Améliorations vs V2 :
+Nouveautés V4 — aide à la décision sur la tendance à venir :
+- Module DESCRIPTIF (pas de prédiction) : ADX (force de tendance) + canal de régression
+  linéaire projeté, avec bandes d'écart-type. Purement une extrapolation géométrique du
+  passé récent, explicitement labellisée comme non prédictive.
+- Module PROBABILISTE (ML) : modèle de classification (probabilité de hausse à horizon
+  N jours) entraîné sur les indicateurs déjà calculés, validé en walk-forward strict
+  (TimeSeriesSplit, jamais de fuite du futur vers le passé), avec diagramme de calibration
+  et comparaison à une base de référence naïve (fréquence historique de hausse).
+
+Améliorations héritées de la V3 :
 - Backtest performant (O(n) au lieu de O(n²)) et vectorisation du scoring historique
 - Annualisation dynamique selon l'intervalle (jour / semaine / mois)
 - Gestion du risque dans le backtest : stop-loss, take-profit, sizing basé sur la volatilité
@@ -16,6 +25,7 @@ Améliorations vs V2 :
 - Section "Limites de l'outil"
 
 ⚠️ Cet outil est pédagogique. Il ne constitue pas un conseil en investissement.
+Dépendance additionnelle pour le module ML : scikit-learn (pip install scikit-learn).
 """
 
 import io
@@ -31,6 +41,16 @@ import yfinance as yf
 import pandas_ta_classic as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import roc_auc_score, brier_score_loss
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
 
 # ============================================================
@@ -173,6 +193,18 @@ def calculate_indicators(data):
             df["BB_UPPER"] = bb[upper[0]]
 
     df["ATR"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
+
+    adx = ta.adx(df["High"], df["Low"], df["Close"], length=14)
+    if adx is not None and not adx.empty:
+        adx_col = [c for c in adx.columns if str(c).startswith("ADX_")]
+        dip_col = [c for c in adx.columns if str(c).startswith("DMP_")]
+        dim_col = [c for c in adx.columns if str(c).startswith("DMN_")]
+        if adx_col:
+            df["ADX"] = adx[adx_col[0]]
+        if dip_col:
+            df["DI_PLUS"] = adx[dip_col[0]]
+        if dim_col:
+            df["DI_MINUS"] = adx[dim_col[0]]
 
     df["VOLUME_SMA20"] = ta.sma(df["Volume"], length=20)
     df["VOLUME_RATIO"] = df["Volume"] / df["VOLUME_SMA20"]
@@ -419,6 +451,274 @@ def detect_recent_signals(df, lookback=10):
                 events.append((date, "🟠 Cassure en-dessous de la bande de Bollinger basse"))
 
     return sorted(events, key=lambda x: x[0], reverse=True)
+
+
+# ============================================================
+# MODULE DESCRIPTIF : ADX + CANAL DE REGRESSION
+# (extrapolation géométrique du passé récent — PAS une prédiction)
+# ============================================================
+
+def interpret_adx(adx_value, di_plus, di_minus):
+    if pd.isna(adx_value):
+        return "⚪ Données insuffisantes"
+
+    if adx_value < 20:
+        strength = "tendance faible / marché sans direction claire"
+        icon = "⚪"
+    elif adx_value < 40:
+        strength = "tendance modérée"
+        icon = "🟡"
+    else:
+        strength = "tendance forte"
+        icon = "🟢"
+
+    direction = ""
+    if pd.notna(di_plus) and pd.notna(di_minus):
+        direction = " (orientation haussière)" if di_plus > di_minus else " (orientation baissière)"
+
+    return f"{icon} ADX {adx_value:.1f} — {strength}{direction}"
+
+
+def regression_channel(df, window=50, projection=10, interval="1d"):
+    """
+    Régression linéaire sur les `window` dernières clôtures + bandes d'écart-type,
+    projetées sur `projection` périodes futures. C'est une simple extrapolation
+    géométrique de la tendance récente — elle ne modélise aucun mécanisme de marché
+    et n'a aucune valeur prédictive démontrée. À interpréter comme une visualisation
+    descriptive, pas comme une prévision.
+    """
+    close = df["Close"].dropna()
+    if len(close) < window:
+        return None
+
+    recent = close.iloc[-window:]
+    x = np.arange(window)
+    slope, intercept = np.polyfit(x, recent.values, 1)
+    fit = slope * x + intercept
+    residuals = recent.values - fit
+    std = residuals.std()
+
+    ss_res = np.sum(residuals ** 2)
+    ss_tot = np.sum((recent.values - recent.values.mean()) ** 2)
+    r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    freq_map = {"1d": "B", "1wk": "W", "1mo": "ME"}
+    freq = freq_map.get(interval, "B")
+    future_dates = pd.date_range(
+        start=recent.index[-1], periods=projection + 1, freq=freq
+    )[1:]
+
+    x_future = np.arange(window, window + projection)
+    fit_future = slope * x_future + intercept
+
+    return {
+        "dates": recent.index,
+        "fit": fit,
+        "future_dates": future_dates,
+        "fit_future": fit_future,
+        "std": std,
+        "slope": slope,
+        "r_squared": r_squared,
+        "close": recent,
+    }
+
+
+def regression_channel_chart(df, channel, context_window=100):
+    context = df["Close"].dropna().iloc[-context_window:]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=context.index, y=context.values, name="Cours", line=dict(width=2)))
+
+    all_x = list(channel["dates"]) + list(channel["future_dates"])
+    all_fit = list(channel["fit"]) + list(channel["fit_future"])
+
+    fig.add_trace(
+        go.Scatter(
+            x=all_x, y=all_fit, name="Extrapolation linéaire",
+            line=dict(width=2, dash="dash", color="orange"),
+        )
+    )
+
+    for n_std, opacity in [(1, 0.18), (2, 0.08)]:
+        upper = [v + n_std * channel["std"] for v in all_fit]
+        lower = [v - n_std * channel["std"] for v in all_fit]
+        fig.add_trace(go.Scatter(x=all_x, y=upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(
+            go.Scatter(
+                x=all_x, y=lower, line=dict(width=0), fill="tonexty",
+                fillcolor=f"rgba(255,165,0,{opacity})",
+                name=f"± {n_std} écart-type", hoverinfo="skip",
+            )
+        )
+
+    fig.add_vline(x=channel["dates"][-1], line_dash="dot", line_color="gray")
+
+    fig.update_layout(
+        title="Canal de régression — extrapolation descriptive (NON prédictive)",
+        height=450, hovermode="x unified",
+    )
+    return fig
+
+
+def adx_chart(df):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df["ADX"], name="ADX", line=dict(width=2)))
+    if "DI_PLUS" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["DI_PLUS"], name="DI+", line=dict(width=1)))
+    if "DI_MINUS" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["DI_MINUS"], name="DI−", line=dict(width=1)))
+    fig.add_hline(y=25, line_dash="dash", annotation_text="Tendance forte (>25)")
+    fig.add_hline(y=20, line_dash="dot", annotation_text="Seuil tendance faible (<20)")
+    fig.update_layout(title="ADX 14 — Force de la tendance (pas sa direction future)", height=350, hovermode="x unified")
+    return fig
+
+
+# ============================================================
+# MODULE PROBABILISTE (ML) : classification à horizon N jours
+# Validation en walk-forward strict — aucune fuite du futur.
+# ============================================================
+
+ML_FEATURE_COLUMNS = [
+    "RSI", "MACD", "MACD_HIST", "ADX", "VOLUME_RATIO", "VOLATILITY_20",
+]
+
+
+def build_ml_dataset(df, horizon=5):
+    """
+    Construit X (features) / y (cible binaire : hausse à horizon `horizon` périodes)
+    à partir des indicateurs déjà calculés de façon causale. Ajoute quelques features
+    dérivées (distance relative aux moyennes mobiles, position dans les bandes de
+    Bollinger, rendement récent) qui ne dépendent, comme le reste, que du passé.
+    """
+    data = df.copy()
+
+    data["DIST_SMA50"] = (data["Close"] / data["SMA_50"] - 1) * 100
+    data["DIST_SMA200"] = (data["Close"] / data["SMA_200"] - 1) * 100
+    bb_range = (data["BB_UPPER"] - data["BB_LOWER"]).replace(0, np.nan)
+    data["BB_POSITION"] = (data["Close"] - data["BB_LOWER"]) / bb_range
+    data["RET_5"] = data["Close"].pct_change(5) * 100
+    data["RET_10"] = data["Close"].pct_change(10) * 100
+
+    feature_cols = ML_FEATURE_COLUMNS + [
+        "DIST_SMA50", "DIST_SMA200", "BB_POSITION", "RET_5", "RET_10",
+    ]
+    feature_cols = [c for c in feature_cols if c in data.columns]
+
+    # Cible : le cours sera-t-il plus haut dans `horizon` périodes ?
+    data["TARGET"] = (data["Close"].shift(-horizon) > data["Close"]).astype(float)
+    # Les dernières `horizon` lignes n'ont pas encore de cible connue (à prédire, pas à entraîner)
+    data.loc[data.index[-horizon:], "TARGET"] = np.nan
+
+    dataset = data[feature_cols + ["TARGET", "Close"]].dropna(subset=feature_cols)
+
+    return dataset, feature_cols
+
+
+def walk_forward_evaluation(dataset, feature_cols, n_splits=5):
+    """
+    TimeSeriesSplit = fenêtre d'entraînement en expansion, toujours suivie dans le temps
+    par le pli de test (jamais l'inverse). C'est la condition minimale pour qu'une
+    évaluation de modèle sur séries temporelles financières ait un sens.
+    """
+    labeled = dataset.dropna(subset=["TARGET"])
+    if len(labeled) < 60:
+        return None
+
+    X = labeled[feature_cols].values
+    y = labeled["TARGET"].values
+
+    n_splits = min(n_splits, max(2, len(labeled) // 40))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    fold_results = []
+    all_test_probs = []
+    all_test_true = []
+
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+            continue
+
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=1000, C=1.0)),
+        ])
+        model.fit(X_train, y_train)
+        probs = model.predict_proba(X_test)[:, 1]
+
+        auc = roc_auc_score(y_test, probs)
+        brier = brier_score_loss(y_test, probs)
+        base_rate = y_train.mean()
+        naive_brier = brier_score_loss(y_test, np.full_like(probs, base_rate))
+
+        fold_results.append({
+            "AUC": auc, "Brier": brier, "Brier_naif": naive_brier,
+            "n_train": len(X_train), "n_test": len(X_test),
+        })
+        all_test_probs.extend(probs)
+        all_test_true.extend(y_test)
+
+    if not fold_results:
+        return None
+
+    return {
+        "folds": pd.DataFrame(fold_results),
+        "test_probs": np.array(all_test_probs),
+        "test_true": np.array(all_test_true),
+        "base_rate": labeled["TARGET"].mean(),
+    }
+
+
+def predict_latest_probability(dataset, feature_cols):
+    """Entraîne sur tout l'historique labellisé, prédit sur la dernière ligne (non labellisée)."""
+    labeled = dataset.dropna(subset=["TARGET"])
+    unlabeled = dataset[dataset["TARGET"].isna()]
+
+    if labeled.empty or unlabeled.empty:
+        return np.nan
+
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=1000, C=1.0)),
+    ])
+    model.fit(labeled[feature_cols].values, labeled["TARGET"].values)
+
+    latest_features = unlabeled[feature_cols].iloc[[-1]].values
+    proba = model.predict_proba(latest_features)[0, 1]
+    return proba
+
+
+def reliability_diagram(test_probs, test_true, n_bins=8):
+    bins = np.linspace(0, 1, n_bins + 1)
+    bin_idx = np.digitize(test_probs, bins) - 1
+    bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+
+    mean_pred, mean_actual, counts = [], [], []
+    for b in range(n_bins):
+        mask = bin_idx == b
+        if mask.sum() == 0:
+            continue
+        mean_pred.append(test_probs[mask].mean())
+        mean_actual.append(test_true[mask].mean())
+        counts.append(int(mask.sum()))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Calibration parfaite", line=dict(dash="dot", color="gray")))
+    fig.add_trace(
+        go.Scatter(
+            x=mean_pred, y=mean_actual, mode="markers+lines", name="Modèle",
+            marker=dict(size=[max(8, min(30, c)) for c in counts]),
+            text=[f"n={c}" for c in counts], hovertemplate="Prédit=%{x:.2f}<br>Observé=%{y:.2f}<br>%{text}",
+        )
+    )
+    fig.update_layout(
+        title="Diagramme de calibration (plis de test walk-forward)",
+        xaxis_title="Probabilité prédite", yaxis_title="Fréquence observée de hausse",
+        height=400, xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]),
+    )
+    return fig
 
 
 # ============================================================
@@ -805,6 +1105,21 @@ sizing_label = st.sidebar.selectbox(
 )
 sizing = "volatility" if "volatilité" in sizing_label else "fixed"
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔮 Tendance à venir")
+
+regression_window = st.sidebar.slider(
+    "Fenêtre du canal de régression", 20, 150, 50, 5,
+    help="Nombre de séances récentes utilisées pour l'extrapolation linéaire.",
+)
+regression_projection = st.sidebar.slider(
+    "Projection (périodes futures)", 5, 30, 10, 5,
+)
+ml_horizon = st.sidebar.slider(
+    "Horizon du modèle ML (périodes)", 3, 20, 5, 1,
+    help="Le modèle estime la probabilité que le cours soit plus haut dans N périodes.",
+)
+
 
 # ============================================================
 # TITRE
@@ -1013,6 +1328,138 @@ with tab4:
 
 with tab5:
     st.dataframe(df.tail(250), use_container_width=True)
+
+
+# ============================================================
+# AIDE A LA DECISION — TENDANCE A VENIR
+# ============================================================
+
+st.markdown("---")
+st.header("🔮 Aide à la décision — tendance à venir")
+
+st.warning(
+    "**À lire avant d'utiliser cette section.** Rien ci-dessous ne prédit le prix futur "
+    "avec certitude. Le module *descriptif* prolonge géométriquement la tendance récente "
+    "(aucun mécanisme de marché modélisé). Le module *probabiliste* donne une probabilité "
+    "statistique issue d'un modèle simple, évaluée honnêtement en walk-forward — mais un "
+    "AUC proche de 0,5 signifie une performance proche du hasard, et les marchés changent "
+    "de régime dans le temps. Ce n'est pas un conseil en investissement."
+)
+
+desc_tab, ml_tab = st.tabs(["📐 Module descriptif (ADX + canal)", "🤖 Module probabiliste (ML)"])
+
+with desc_tab:
+    st.caption(
+        "Extrapolation géométrique du passé récent — utile pour visualiser la pente et la "
+        "force de la tendance actuelle, pas pour prédire un prix futur."
+    )
+
+    if "ADX" in df.columns:
+        adx_row = df.iloc[-1]
+        st.info(interpret_adx(
+            safe_float(adx_row.get("ADX")),
+            safe_float(adx_row.get("DI_PLUS")),
+            safe_float(adx_row.get("DI_MINUS")),
+        ))
+        st.plotly_chart(adx_chart(df), use_container_width=True)
+    else:
+        st.caption("ADX indisponible pour ce titre.")
+
+    channel = regression_channel(df, window=regression_window, projection=regression_projection, interval=interval)
+    if channel is None:
+        st.caption("Historique insuffisant pour calculer le canal de régression.")
+    else:
+        direction = "haussière" if channel["slope"] > 0 else "baissière"
+        st.write(
+            f"Pente de la régression sur les {regression_window} dernières séances : "
+            f"orientation **{direction}**, ajustement R² = **{channel['r_squared']:.2f}** "
+            f"(proche de 1 = tendance récente très linéaire, proche de 0 = bruitée)."
+        )
+        st.plotly_chart(regression_channel_chart(df, channel), use_container_width=True)
+
+with ml_tab:
+    if not SKLEARN_AVAILABLE:
+        st.error(
+            "scikit-learn n'est pas installé dans cet environnement. "
+            "Installez-le avec `pip install scikit-learn` pour activer ce module."
+        )
+    else:
+        st.caption(
+            f"Estime la probabilité que {selected} soit plus haut dans {ml_horizon} "
+            "période(s), à partir d'un modèle de régression logistique entraîné sur les "
+            "indicateurs techniques déjà calculés."
+        )
+
+        if st.button("▶️ Entraîner et évaluer le modèle", type="primary"):
+            with st.spinner("Construction du jeu de données et validation walk-forward..."):
+                dataset, feature_cols = build_ml_dataset(df, horizon=ml_horizon)
+                eval_result = walk_forward_evaluation(dataset, feature_cols)
+
+            if eval_result is None:
+                st.error(
+                    "Historique insuffisant ou classes trop déséquilibrées pour une "
+                    "évaluation walk-forward fiable sur ce titre."
+                )
+            else:
+                folds = eval_result["folds"]
+                mean_auc = folds["AUC"].mean()
+                mean_brier = folds["Brier"].mean()
+                mean_naive_brier = folds["Brier_naif"].mean()
+                base_rate = eval_result["base_rate"]
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric(
+                        "AUC moyen (walk-forward)", fmt(mean_auc, 3),
+                        help="0.50 = équivalent au hasard. > 0.55 déjà notable sur des prix d'actions. > 0.65 est rare et mérite d'être vérifié pour de la fuite de données.",
+                    )
+                with c2:
+                    st.metric(
+                        "Brier score du modèle", fmt(mean_brier, 3),
+                        help="Plus bas = mieux calibré. À comparer au Brier naïf ci-contre.",
+                    )
+                with c3:
+                    st.metric("Brier score naïf (fréquence de base)", fmt(mean_naive_brier, 3))
+                with c4:
+                    st.metric("Fréquence historique de hausse", fmt(base_rate * 100, 1, "%"))
+
+                if mean_auc < 0.53:
+                    st.warning(
+                        "AUC proche de 0,50 : ce modèle n'apporte quasiment aucune information "
+                        "directionnelle sur ce titre avec cet horizon. Le considérer comme non "
+                        "informatif plutôt que d'en tirer un signal."
+                    )
+                elif mean_brier >= mean_naive_brier:
+                    st.warning(
+                        "Le modèle ne bat pas la base de référence naïve (fréquence historique "
+                        "de hausse) en termes de calibration. Il n'apporte pas d'avantage "
+                        "démontré ici."
+                    )
+
+                st.plotly_chart(
+                    reliability_diagram(eval_result["test_probs"], eval_result["test_true"]),
+                    use_container_width=True,
+                )
+
+                with st.expander("Détail par pli de validation (walk-forward)"):
+                    st.dataframe(folds.round(3), use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+                proba = predict_latest_probability(dataset, feature_cols)
+                if pd.notna(proba):
+                    st.metric(
+                        f"Probabilité estimée de hausse à {ml_horizon} période(s)",
+                        f"{proba * 100:.1f}%",
+                        help="Calculée par un modèle entraîné sur tout l'historique labellisé disponible. Sa fiabilité est celle mesurée ci-dessus, pas une garantie.",
+                    )
+                    st.caption(
+                        "Cette probabilité vient du même type de modèle que celui évalué "
+                        "ci-dessus. Si l'AUC est proche de 0,50 ou si le modèle ne bat pas la "
+                        "base naïve, ce chiffre ne doit pas être interprété comme un signal "
+                        "fiable — il reflète surtout la fréquence historique de hausse."
+                    )
+                else:
+                    st.caption("Impossible de calculer une probabilité pour la dernière séance (données manquantes).")
 
 
 # ============================================================
