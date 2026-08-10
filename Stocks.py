@@ -52,6 +52,12 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    AUTOREFRESH_AVAILABLE = False
+
 
 # ============================================================
 # CONFIGURATION
@@ -64,7 +70,8 @@ st.set_page_config(
 )
 
 DEFAULT_TICKERS = (
-      "SOI.PA, DBV.PA,GNFT.PA"
+    "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,"
+    "AVGO,AMD,JPM,AIR.PA,MC.PA,TTE.PA,OR.PA"
 )
 
 ANNUALIZATION_FACTORS = {
@@ -148,6 +155,52 @@ def download_all(tickers, period, interval, max_workers=8):
                 results[ticker] = pd.DataFrame()
     # Restaure l'ordre initial des tickers
     return {ticker: results[ticker] for ticker in tickers if ticker in results}
+
+
+def _get_fast_info_value(fast_info, keys):
+    """yfinance expose fast_info tantôt en accès dict, tantôt en attribut selon la version."""
+    for key in keys:
+        try:
+            value = fast_info[key]
+            if value is not None:
+                return value
+        except Exception:
+            pass
+        try:
+            value = getattr(fast_info, key)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+    return np.nan
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_last_price(ticker):
+    """
+    Récupère uniquement le dernier prix connu (pas tout l'historique), avec un cache
+    court (60s) pour permettre une actualisation plus fréquente sans retélécharger le
+    dataset complet à chaque fois. Reste soumis au même délai (~15-20 min) que le reste
+    des données Yahoo Finance : ce n'est PAS un flux temps réel garanti.
+    """
+    try:
+        fast = yf.Ticker(ticker).fast_info
+    except Exception:
+        return None
+
+    price = safe_float(_get_fast_info_value(fast, ["last_price", "lastPrice"]))
+    prev_close = safe_float(
+        _get_fast_info_value(fast, ["previous_close", "previousClose", "regular_market_previous_close"])
+    )
+
+    if pd.isna(price):
+        return None
+
+    return {
+        "price": price,
+        "prev_close": prev_close,
+        "fetched_at": pd.Timestamp.now(),
+    }
 
 
 # ============================================================
@@ -1074,6 +1127,38 @@ interval = st.sidebar.selectbox("Intervalle", ["1d", "1wk", "1mo"], index=0)
 st.session_state["annual_factor"] = get_annualization_factor(interval)
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🔄 Actualisation")
+
+if st.sidebar.button("Actualiser maintenant"):
+    download_data.clear()
+    fetch_last_price.clear()
+    st.session_state["last_manual_refresh"] = pd.Timestamp.now()
+    st.rerun()
+
+if st.session_state.get("last_manual_refresh") is not None:
+    st.sidebar.caption(
+        f"Dernière actualisation forcée : {st.session_state['last_manual_refresh'].strftime('%H:%M:%S')}"
+    )
+
+if AUTOREFRESH_AVAILABLE:
+    auto_refresh = st.sidebar.checkbox("Auto-actualisation périodique", value=False)
+    if auto_refresh:
+        refresh_choice = st.sidebar.selectbox("Intervalle", ["1 min", "5 min", "15 min"], index=1)
+        refresh_minutes = {"1 min": 1, "5 min": 5, "15 min": 15}[refresh_choice]
+        st_autorefresh(interval=refresh_minutes * 60 * 1000, key="autorefresh_timer")
+else:
+    st.sidebar.caption(
+        "Pour l'auto-actualisation périodique : `pip install streamlit-autorefresh`"
+    )
+
+st.sidebar.caption(
+    "ℹ️ Les cours proviennent de Yahoo Finance et sont généralement différés de "
+    "15 à 20 minutes, quel que soit le rythme d'actualisation choisi ici. "
+    "L'historique complet est mis en cache 15 min ; le dernier cours (onglet détaillé) "
+    "1 min."
+)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Backtest")
 
 threshold = st.sidebar.slider("Seuil d'entrée", 40, 90, 65, 5,
@@ -1261,6 +1346,26 @@ st.header("🔎 Analyse détaillée")
 
 selected = st.selectbox("Action", list(all_data.keys()))
 df = all_data[selected]
+
+live = fetch_last_price(selected)
+if live:
+    delta_pct = None
+    if pd.notna(live["prev_close"]) and live["prev_close"] != 0:
+        delta_pct = (live["price"] / live["prev_close"] - 1) * 100
+    c_live, c_caption = st.columns([1, 3])
+    with c_live:
+        st.metric(
+            f"🔴 {selected} — dernier cours connu",
+            fmt(live["price"]),
+            delta=f"{delta_pct:+.2f}%" if delta_pct is not None else None,
+            help="Source Yahoo Finance (fast_info), généralement différée de 15 à 20 minutes.",
+        )
+    with c_caption:
+        st.caption(
+            f"Récupéré à {live['fetched_at'].strftime('%H:%M:%S')} (cache 60 s). "
+            "Pas un flux temps réel garanti — voir la note sur l'actualisation dans la barre latérale."
+        )
+
 components = df[["SCORE", "SIGNAL", "Tendance", "RSI_pts", "MACD_pts", "Bollinger_pts", "Volume_pts", "Momentum_pts"]]
 
 score, signal, details = get_latest_score_info(components)
