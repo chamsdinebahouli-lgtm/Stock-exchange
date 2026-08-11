@@ -69,9 +69,7 @@ st.set_page_config(
     layout="wide",
 )
 
-DEFAULT_TICKERS = (
-    "SOI.PA, GNFT.PA, DBV.PA"
-)
+DEFAULT_TICKERS = ["SOI.PA", "GNFT.PA", "DBV.PA"]
 
 ANNUALIZATION_FACTORS = {
     "1d": 252,
@@ -1112,13 +1110,74 @@ def to_excel(sheets: dict):
 
 st.sidebar.title("⚙️ Paramètres")
 
-ticker_input = st.sidebar.text_area("Actions à analyser", value=DEFAULT_TICKERS, height=130)
+st.sidebar.subheader("📋 Actions suivies")
 
-tickers = [
-    ticker.strip().upper()
-    for ticker in ticker_input.replace("\n", ",").split(",")
-    if ticker.strip()
-]
+if "watchlist" not in st.session_state:
+    st.session_state["watchlist"] = list(DEFAULT_TICKERS)
+
+
+def _add_ticker(raw_value):
+    """Ajoute un ou plusieurs tickers (séparés par virgule/saut de ligne) à la watchlist."""
+    added, already_present = [], []
+    for candidate in raw_value.replace("\n", ",").split(","):
+        candidate = candidate.strip().upper()
+        if not candidate:
+            continue
+        if candidate in st.session_state["watchlist"]:
+            already_present.append(candidate)
+        else:
+            st.session_state["watchlist"].append(candidate)
+            added.append(candidate)
+    return added, already_present
+
+
+# --- Ajout rapide d'un ticker ---
+with st.sidebar.form("add_ticker_form", clear_on_submit=True):
+    new_ticker = st.text_input(
+        "Ajouter un ticker",
+        placeholder="ex : AAPL, MC.PA, ^FCHI...",
+        label_visibility="collapsed",
+    )
+    submitted = st.form_submit_button("➕ Ajouter à la liste", use_container_width=True)
+    if submitted and new_ticker.strip():
+        added, already_present = _add_ticker(new_ticker)
+        if added:
+            st.toast(f"Ajouté : {', '.join(added)}")
+        if already_present:
+            st.toast(f"Déjà dans la liste : {', '.join(already_present)}")
+
+# --- Liste actuelle, avec bouton de suppression par ticker ---
+if st.session_state["watchlist"]:
+    for t in list(st.session_state["watchlist"]):
+        col_name, col_remove = st.sidebar.columns([4, 1])
+        col_name.markdown(f"`{t}`")
+        if col_remove.button("✕", key=f"remove_ticker_{t}", help=f"Retirer {t}"):
+            st.session_state["watchlist"].remove(t)
+            st.rerun()
+else:
+    st.sidebar.caption("Liste vide — ajoutez au moins un ticker ci-dessus.")
+
+# --- Import en masse / réinitialisation ---
+with st.sidebar.expander("📥 Import en masse / réinitialiser"):
+    bulk_input = st.text_area(
+        "Coller une liste (virgules ou sauts de ligne)",
+        placeholder="AAPL, MSFT, MC.PA",
+        height=90,
+        key="bulk_ticker_input",
+    )
+    col_import, col_reset = st.columns(2)
+    with col_import:
+        if st.button("Importer", use_container_width=True) and bulk_input.strip():
+            added, already_present = _add_ticker(bulk_input)
+            if added:
+                st.toast(f"Ajouté : {', '.join(added)}")
+            st.rerun()
+    with col_reset:
+        if st.button("↺ Réinitialiser", use_container_width=True):
+            st.session_state["watchlist"] = list(DEFAULT_TICKERS)
+            st.rerun()
+
+tickers = list(st.session_state["watchlist"])
 
 period = st.sidebar.selectbox("Historique", ["6mo", "1y", "2y", "5y", "10y", "max"], index=3)
 interval = st.sidebar.selectbox("Intervalle", ["1d", "1wk", "1mo"], index=0)
