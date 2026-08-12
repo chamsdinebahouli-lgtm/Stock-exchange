@@ -414,6 +414,18 @@ def get_latest_score_info(components):
     return int(row["SCORE"]), row["SIGNAL"], details
 
 
+def get_score_delta(components, lookback=1):
+    """
+    Variation du score entre la dernière séance et celle `lookback` période(s) avant.
+    Retourne (delta, score_precedent) ou (np.nan, np.nan) si l'historique est trop court.
+    """
+    if len(components) <= lookback:
+        return np.nan, np.nan
+    latest = int(components["SCORE"].iloc[-1])
+    previous = int(components["SCORE"].iloc[-1 - lookback])
+    return latest - previous, previous
+
+
 # ============================================================
 # TENDANCE
 # ============================================================
@@ -1305,6 +1317,7 @@ with st.spinner("Calcul des indicateurs et des scores..."):
         all_data[ticker] = df
 
         score, signal, details = get_latest_score_info(components)
+        score_delta, score_prev = get_score_delta(components, lookback=1)
         trend = detect_trend(df)
         row = df.iloc[-1]
         close = safe_float(row["Close"])
@@ -1314,6 +1327,15 @@ with st.spinner("Calcul des indicateurs et des scores..."):
             old = safe_float(df["Close"].iloc[-21])
             if pd.notna(old) and old != 0:
                 one_month_return = (close / old - 1) * 100
+
+        if pd.isna(score_delta):
+            score_trend_icon = "⚪"
+        elif score_delta > 0:
+            score_trend_icon = "🔼"
+        elif score_delta < 0:
+            score_trend_icon = "🔽"
+        else:
+            score_trend_icon = "➖"
 
         results.append(
             {
@@ -1327,6 +1349,8 @@ with st.spinner("Calcul des indicateurs et des scores..."):
                 "Volume / Moy.20": safe_float(row.get("VOLUME_RATIO")),
                 "Perf. 1 mois": one_month_return,
                 "Score": score,
+                "Δ Score (veille)": score_delta,
+                "Tendance score": score_trend_icon,
                 "Signal": signal,
                 "Tendance": trend,
             }
@@ -1427,6 +1451,7 @@ if live:
 components = df[["SCORE", "SIGNAL", "Tendance", "RSI_pts", "MACD_pts", "Bollinger_pts", "Volume_pts", "Momentum_pts"]]
 
 score, signal, details = get_latest_score_info(components)
+score_delta, score_prev = get_score_delta(components, lookback=1)
 trend = detect_trend(df)
 row = df.iloc[-1]
 
@@ -1440,7 +1465,12 @@ with c3:
 with c4:
     st.metric("SMA 200", fmt(row["SMA_200"]))
 with c5:
-    st.metric("Score", f"{score}/100", help="Heuristique pondérée (tendance, RSI, MACD, Bollinger, volume, momentum). Non calibrée statistiquement — voir la section Limites.")
+    st.metric(
+        "Score",
+        f"{score}/100",
+        delta=None if pd.isna(score_delta) else f"{score_delta:+d} vs veille",
+        help="Heuristique pondérée (tendance, RSI, MACD, Bollinger, volume, momentum). Non calibrée statistiquement — voir la section Limites.",
+    )
 with c6:
     st.metric("Signal", signal)
 
@@ -1485,8 +1515,36 @@ with tab3:
         st.metric("ATR 14", fmt(row.get("ATR"), 2))
 
 with tab4:
-    st.plotly_chart(score_history_chart(components, threshold), use_container_width=True)
+    window_choice = st.radio(
+        "Fenêtre affichée",
+        ["10 séances", "20 séances", "60 séances", "Tout l'historique"],
+        index=1,
+        horizontal=True,
+        help="Sur tout l'historique (plusieurs mois/années), les variations jour à jour sont écrasées visuellement — réduisez la fenêtre pour les voir clairement.",
+    )
+    window_map = {"10 séances": 10, "20 séances": 20, "60 séances": 60, "Tout l'historique": None}
+    n_sessions = window_map[window_choice]
+    components_window = components if n_sessions is None else components.tail(n_sessions)
+
+    st.plotly_chart(score_history_chart(components_window, threshold), use_container_width=True)
     st.caption("Permet de voir si le score est stable dans le temps ou s'il oscille beaucoup autour du seuil.")
+
+    st.markdown("**Détail jour par jour**")
+    table_n = min(n_sessions or 30, 30)  # la table reste lisible même si le graphique montre tout
+    daily = components["SCORE"].tail(table_n + 1).to_frame()
+    daily["Δ vs veille"] = daily["SCORE"].diff()
+    daily = daily.iloc[1:].sort_index(ascending=False)  # la 1ère ligne sert seulement au calcul du 1er delta
+    daily_display = pd.DataFrame(
+        {
+            "Date": daily.index.strftime("%Y-%m-%d"),
+            "Score": daily["SCORE"].astype(int),
+            "Δ vs veille": daily["Δ vs veille"].apply(
+                lambda v: "—" if pd.isna(v) else f"{int(v):+d}"
+            ),
+            "Signal": components.loc[daily.index, "SIGNAL"].values,
+        }
+    )
+    st.dataframe(daily_display, use_container_width=True, hide_index=True)
 
 with tab5:
     st.dataframe(df.tail(250), use_container_width=True)
