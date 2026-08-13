@@ -621,6 +621,113 @@ def regression_channel_chart(df, channel, context_window=100):
     return fig
 
 
+def rolling_regression_stats(df, window=50):
+    """
+    Calcule, pour CHAQUE date de l'historique, la pente et le R² de la régression
+    linéaire sur les `window` séances précédentes (même logique que `regression_channel`,
+    mais glissée sur tout l'historique au lieu d'un seul point). Calcul vectorisé en
+    O(n) via des sommes cumulées pondérées, plutôt qu'un np.polyfit par fenêtre (ce qui
+    serait O(n * window)).
+
+    La pente est aussi exprimée en % du prix (SLOPE_PCT) pour rester comparable entre
+    titres à des niveaux de prix différents. Comme le canal de régression, ceci reste une
+    extrapolation géométrique descriptive du passé récent — pas une prédiction.
+    """
+    close = df["Close"]
+    n = len(close)
+    idx = df.index
+
+    if n < window + 1:
+        return pd.DataFrame(
+            {"SLOPE": np.nan, "SLOPE_PCT": np.nan, "R2": np.nan}, index=idx
+        )
+
+    y = close.to_numpy(dtype=float)
+    pos = np.arange(n, dtype=float)
+
+    s1 = pd.Series(y, index=idx).rolling(window).sum()
+    s2 = pd.Series(y ** 2, index=idx).rolling(window).sum()
+
+    weighted_cumsum = pd.Series(np.cumsum(pos * y), index=idx)
+    weighted_cumsum_shifted = weighted_cumsum.shift(window).fillna(0.0)
+    sum_jy = weighted_cumsum - weighted_cumsum_shifted  # sum_{j=t-w+1}^{t} j*y_j
+
+    t_pos = pd.Series(pos, index=idx)
+    window_start = t_pos - window + 1
+    sum_xy = sum_jy - window_start * s1  # ramène x à une base locale 0..window-1
+
+    sum_x = window * (window - 1) / 2
+    sum_x2 = (window - 1) * window * (2 * window - 1) / 6
+    denom = window * sum_x2 - sum_x ** 2
+
+    slope = (window * sum_xy - sum_x * s1) / denom
+
+    ss_xx = sum_x2 - (sum_x ** 2) / window
+    ss_yy = s2 - (s1 ** 2) / window
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2 = (slope ** 2 * ss_xx) / ss_yy
+    r2 = r2.replace([np.inf, -np.inf], np.nan)
+
+    slope.iloc[: window - 1] = np.nan
+    r2.iloc[: window - 1] = np.nan
+
+    slope_pct = (slope / close.replace(0, np.nan)) * 100
+
+    return pd.DataFrame({"SLOPE": slope, "SLOPE_PCT": slope_pct, "R2": r2}, index=idx)
+
+
+def detect_regression_inflections(slope_stats, lookback=20):
+    """
+    Repère les changements de signe de la pente glissante sur les `lookback` dernières
+    séances : la tendance récente s'inverse (extrapolation linéaire uniquement — pas de
+    garantie que ça se poursuive).
+    """
+    events = []
+    recent = slope_stats["SLOPE"].dropna().tail(lookback + 1)
+    if len(recent) < 2:
+        return events
+
+    for i in range(1, len(recent)):
+        prev_val, curr_val = recent.iloc[i - 1], recent.iloc[i]
+        date = recent.index[i]
+        if prev_val <= 0 < curr_val:
+            events.append((date, "🟢 Pente de régression passe positive (inflexion potentielle)"))
+        elif prev_val >= 0 > curr_val:
+            events.append((date, "🔴 Pente de régression passe négative (inflexion potentielle)"))
+
+    return sorted(events, key=lambda x: x[0], reverse=True)
+
+
+def regression_slope_chart(slope_stats, window):
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.06, row_heights=[0.65, 0.35],
+        subplot_titles=(
+            f"Pente de régression glissante ({window} séances) — en % du prix",
+            "R² glissant — qualité de l'ajustement linéaire",
+        ),
+    )
+
+    colors = np.where(slope_stats["SLOPE_PCT"] >= 0, "#2ca02c", "#d62728")
+    fig.add_trace(
+        go.Bar(x=slope_stats.index, y=slope_stats["SLOPE_PCT"], marker_color=colors, name="Pente (%)"),
+        row=1, col=1,
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", row=1, col=1)
+
+    fig.add_trace(
+        go.Scatter(x=slope_stats.index, y=slope_stats["R2"], name="R²", line=dict(width=2, color="#1f77b4")),
+        row=2, col=1,
+    )
+    fig.add_hline(y=0.5, line_dash="dot", annotation_text="R² = 0.5", row=2, col=1)
+
+    fig.update_yaxes(title_text="% du prix / période", row=1, col=1)
+    fig.update_yaxes(title_text="R²", range=[0, 1], row=2, col=1)
+    fig.update_layout(height=500, hovermode="x unified", showlegend=False)
+    return fig
+
+
 def adx_chart(df):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df["ADX"], name="ADX", line=dict(width=2)))
@@ -1596,6 +1703,46 @@ with desc_tab:
             f"(proche de 1 = tendance récente très linéaire, proche de 0 = bruitée)."
         )
         st.plotly_chart(regression_channel_chart(df, channel), use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("**Pente de régression dans le temps**")
+    st.caption(
+        "La pente ci-dessus n'est qu'un instantané. En la recalculant à chaque séance "
+        "(même fenêtre glissante), on peut voir si elle accélère, ralentit, ou change de "
+        "signe — un changement de signe signale une inflexion potentielle de la tendance "
+        "récente, souvent plus tôt qu'un croisement de moyennes mobiles (qui est lissé sur "
+        "une fenêtre plus longue). Le R² glissant indique en parallèle si la tendance reste "
+        "linéaire ou si le titre entre en range (R² qui chute)."
+    )
+
+    slope_window_choice = st.radio(
+        "Fenêtre affichée",
+        ["20 séances", "60 séances", "120 séances", "Tout l'historique"],
+        index=1,
+        horizontal=True,
+        key="slope_window_choice",
+    )
+    slope_window_map = {
+        "20 séances": 20, "60 séances": 60, "120 séances": 120, "Tout l'historique": None,
+    }
+    n_slope_sessions = slope_window_map[slope_window_choice]
+
+    slope_stats = rolling_regression_stats(df, window=regression_window)
+    slope_stats_display = slope_stats if n_slope_sessions is None else slope_stats.tail(n_slope_sessions)
+
+    if slope_stats["SLOPE"].dropna().empty:
+        st.caption("Historique insuffisant pour calculer la pente glissante sur cette fenêtre.")
+    else:
+        st.plotly_chart(regression_slope_chart(slope_stats_display, regression_window), use_container_width=True)
+
+        inflections = detect_regression_inflections(slope_stats, lookback=30)
+        if inflections:
+            st.markdown("**Inflexions récentes (changement de signe de la pente, 30 dernières séances)**")
+            inflections_df = pd.DataFrame(inflections, columns=["Date", "Événement"])
+            inflections_df["Date"] = inflections_df["Date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(inflections_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Aucun changement de signe de la pente sur les 30 dernières séances.")
 
 with ml_tab:
     if not SKLEARN_AVAILABLE:
