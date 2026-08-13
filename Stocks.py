@@ -269,39 +269,45 @@ def calculate_indicators(data):
 
 
 # ============================================================
-# SCORE (vectorisé sur tout l'historique en une passe)
+# SCORES (vectorisés sur tout l'historique en une passe)
+# Trois scores séparés plutôt qu'un seul agrégat :
+#   - DIRECTION : la structure actuelle favorise-t-elle une hausse ?
+#   - QUALITE   : ce signal directionnel est-il propre ou bruité ?
+#   - RISQUE    : quelle est la dangerosité de la position (0=faible, 100=élevé) ?
+# Chaque composant n'apparaît que dans UN seul des trois scores, pour éviter de compter
+# la même information plusieurs fois sous des habillages différents (ADX et la pente de
+# régression, par exemple, se sont révélés largement redondants au test walk-forward —
+# seul ADX est gardé, dans QUALITE). Comme l'ancien score, ce sont des poids/seuils
+# choisis à la main (voir "Limites de l'outil"), pas calibrés statistiquement — sauf le
+# module ML, qui reste la seule estimation calibrée de l'app.
 # ============================================================
 
-def calculate_score_series(df):
+def _col(df, name):
+    return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
+
+
+def calculate_direction_score_series(df):
     """
-    Calcule le score (0-100) et sa décomposition pour CHAQUE ligne du DataFrame,
-    de façon vectorisée. Comme tous les indicateurs sont calculés de façon causale
-    (rolling windows classiques, aucune fuite du futur), le score à la date i ne
-    dépend que des données jusqu'à i inclus -> pas besoin de re-slicer le DataFrame
-    ligne par ligne comme dans une version naïve (ce qui serait O(n²)).
+    DIRECTION (0-100) : la structure actuelle favorise-t-elle une hausse ?
+    Régime de tendance (SMA) + RSI + MACD + momentum 20j. Ni ADX ni la pente de
+    régression n'y figurent : ce sont des mesures de force/qualité de la tendance,
+    pas de sa direction — elles vont dans le score QUALITE pour éviter les doublons.
     """
-    n = len(df)
     idx = df.index
+    close = _col(df, "Close")
+    sma20, sma50, sma200 = _col(df, "SMA_20"), _col(df, "SMA_50"), _col(df, "SMA_200")
+    rsi = _col(df, "RSI")
+    macd, macd_signal = _col(df, "MACD"), _col(df, "MACD_SIGNAL")
 
-    def col(name):
-        return df[name] if name in df.columns else pd.Series(np.nan, index=idx)
-
-    close = col("Close")
-    sma20, sma50, sma200 = col("SMA_20"), col("SMA_50"), col("SMA_200")
-    rsi = col("RSI")
-    macd, macd_signal = col("MACD"), col("MACD_SIGNAL")
-    bb_lower, bb_upper = col("BB_LOWER"), col("BB_UPPER")
-    volume_ratio = col("VOLUME_RATIO")
-
-    # --- Tendance : 40 pts ---
+    # --- Régime de tendance : 50 pts ---
     trend_points = (
-        np.where(close > sma20, 10, 0)
-        + np.where(close > sma50, 15, 0)
-        + np.where(close > sma200, 10, 0)
-        + np.where(sma50 > sma200, 5, 0)
+        np.where(close > sma20, 12, 0)
+        + np.where(close > sma50, 18, 0)
+        + np.where(close > sma200, 12, 0)
+        + np.where(sma50 > sma200, 8, 0)
     ).astype(float)
 
-    # --- RSI : 20 pts ---
+    # --- RSI : 25 pts ---
     rsi_points = np.select(
         [
             (rsi >= 45) & (rsi <= 60),
@@ -311,7 +317,7 @@ def calculate_score_series(df):
             (rsi < 30),
             (rsi > 70),
         ],
-        [20, 15, 15, 10, 12, 5],
+        [25, 18, 18, 12, 14, 6],
         default=0,
     ).astype(float)
 
@@ -327,35 +333,7 @@ def calculate_score_series(df):
         default=0,
     ).astype(float)
 
-    # --- Bollinger : 10 pts ---
-    bb_range = (bb_upper - bb_lower).replace(0, np.nan)
-    bb_valid = bb_lower.notna() & bb_upper.notna() & (bb_upper > bb_lower)
-    position = (close - bb_lower) / bb_range
-    bb_points = np.select(
-        [
-            bb_valid & (position >= 0.30) & (position <= 0.70),
-            bb_valid & (position >= 0.15) & (position < 0.30),
-            bb_valid & (position > 0.70) & (position <= 0.85),
-            bb_valid & (position < 0.15),
-            bb_valid,
-        ],
-        [10, 8, 7, 6, 3],
-        default=0,
-    ).astype(float)
-
-    # --- Volume : 10 pts ---
-    vol_points = np.select(
-        [
-            volume_ratio >= 1.5,
-            volume_ratio >= 1.0,
-            volume_ratio >= 0.7,
-            volume_ratio.notna(),
-        ],
-        [10, 8, 5, 2],
-        default=0,
-    ).astype(float)
-
-    # --- Momentum : 5 pts ---
+    # --- Momentum 20j : 10 pts ---
     old_price = close.shift(20)
     momentum = (close / old_price - 1) * 100
     momentum_valid = old_price.notna() & (old_price > 0)
@@ -365,15 +343,13 @@ def calculate_score_series(df):
             momentum_valid & (momentum > 0),
             momentum_valid,
         ],
-        [5, 3, 1],
+        [10, 6, 2],
         default=0,
     ).astype(float)
 
-    total = (
-        trend_points + rsi_points + macd_points
-        + bb_points + vol_points + momentum_points
-    )
-    total = pd.Series(total, index=idx).clip(0, 100).round().astype(int)
+    total = pd.Series(
+        trend_points + rsi_points + macd_points + momentum_points, index=idx
+    ).clip(0, 100).round().astype(int)
 
     signal = pd.Series(np.select(
         [total >= 80, total >= 65, total >= 50, total >= 35],
@@ -381,48 +357,178 @@ def calculate_score_series(df):
         default="🔴 VENTE",
     ), index=idx)
 
-    components = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "SCORE": total,
-            "SIGNAL": signal,
-            "Tendance": trend_points,
-            "RSI_pts": rsi_points,
-            "MACD_pts": macd_points,
-            "Bollinger_pts": bb_points,
-            "Volume_pts": vol_points,
-            "Momentum_pts": momentum_points,
+            "DIRECTION_SCORE": total,
+            "DIRECTION_SIGNAL": signal,
+            "DIR_Tendance": trend_points,
+            "DIR_RSI": rsi_points,
+            "DIR_MACD": macd_points,
+            "DIR_Momentum": momentum_points,
         },
         index=idx,
     )
 
-    return components
+
+def calculate_quality_score_series(df):
+    """
+    QUALITE (0-100) : ce signal directionnel est-il propre ou bruité ?
+    ADX (force de tendance — seule mesure de force gardée, la pente/R² de régression
+    étant redondante avec elle) + confirmation par le volume + cohérence entre 3 signaux
+    indépendants (prix vs SMA50, MACD, RSI). Une tendance forte, confirmée par le volume
+    et où les indicateurs sont d'accord entre eux, est un signal plus fiable qu'une
+    tendance atteignant le même score DIRECTION mais sur fond de signaux contradictoires.
+    """
+    idx = df.index
+    close = _col(df, "Close")
+    sma50 = _col(df, "SMA_50")
+    rsi = _col(df, "RSI")
+    macd, macd_signal = _col(df, "MACD"), _col(df, "MACD_SIGNAL")
+    adx = _col(df, "ADX")
+    volume_ratio = _col(df, "VOLUME_RATIO")
+
+    # --- ADX (force de tendance) : 50 pts ---
+    adx_points = np.select(
+        [adx >= 40, (adx >= 20) & (adx < 40), adx.notna()],
+        [50, 30, 10],
+        default=0,
+    ).astype(float)
+
+    # --- Confirmation volume : 25 pts ---
+    vol_points = np.select(
+        [
+            volume_ratio >= 1.5,
+            volume_ratio >= 1.0,
+            volume_ratio >= 0.7,
+            volume_ratio.notna(),
+        ],
+        [25, 20, 12, 5],
+        default=0,
+    ).astype(float)
+
+    # --- Cohérence entre 3 signaux indépendants : 25 pts ---
+    coherence_valid = close.notna() & sma50.notna() & macd.notna() & macd_signal.notna() & rsi.notna()
+    bull_count = (
+        (close > sma50).astype(int)
+        + (macd > macd_signal).astype(int)
+        + (rsi > 50).astype(int)
+    )
+    full_agreement = (bull_count == 3) | (bull_count == 0)
+    coherence_points = np.where(coherence_valid, np.where(full_agreement, 25, 12), 0).astype(float)
+
+    total = pd.Series(
+        adx_points + vol_points + coherence_points, index=idx
+    ).clip(0, 100).round().astype(int)
+
+    signal = pd.Series(np.select(
+        [total >= 70, total >= 40],
+        ["🟢 Signal propre", "🟡 Signal moyen"],
+        default="🔴 Signal bruité",
+    ), index=idx)
+
+    return pd.DataFrame(
+        {
+            "QUALITY_SCORE": total,
+            "QUALITY_SIGNAL": signal,
+            "QUAL_ADX": adx_points,
+            "QUAL_Volume": vol_points,
+            "QUAL_Coherence": coherence_points,
+        },
+        index=idx,
+    )
 
 
-def get_latest_score_info(components):
-    """Extrait le score, le signal et le détail pour la dernière ligne."""
+def calculate_risk_score_series(df):
+    """
+    RISQUE (0-100, plus haut = plus risqué) : quelle est la dangerosité de la position ?
+    Volatilité annualisée 20j + ATR en % du prix + distance à la SMA200 (un titre très
+    étendu par rapport à sa moyenne longue est plus exposé à une correction/reversion).
+    Reste un score descriptif à seuils fixes, pas une mesure de VaR ou de perte probable.
+    """
+    idx = df.index
+    close = _col(df, "Close")
+    sma200 = _col(df, "SMA_200")
+    atr = _col(df, "ATR")
+    volatility = _col(df, "VOLATILITY_20")
+
+    # --- Volatilité annualisée 20j : 40 pts ---
+    volat_points = np.select(
+        [volatility >= 45, (volatility >= 30) & (volatility < 45), (volatility >= 15) & (volatility < 30), volatility.notna()],
+        [40, 28, 14, 5],
+        default=0,
+    ).astype(float)
+
+    # --- ATR en % du prix : 30 pts ---
+    atr_pct = (atr / close.replace(0, np.nan)) * 100
+    atr_points = np.select(
+        [atr_pct >= 5, (atr_pct >= 3) & (atr_pct < 5), (atr_pct >= 1) & (atr_pct < 3), atr_pct.notna()],
+        [30, 20, 10, 3],
+        default=0,
+    ).astype(float)
+
+    # --- Distance (absolue) à la SMA200 : 30 pts ---
+    dist_pct = ((close / sma200.replace(0, np.nan) - 1) * 100).abs()
+    dist_points = np.select(
+        [dist_pct >= 30, (dist_pct >= 15) & (dist_pct < 30), (dist_pct >= 5) & (dist_pct < 15), dist_pct.notna()],
+        [30, 20, 10, 3],
+        default=0,
+    ).astype(float)
+
+    total = pd.Series(
+        volat_points + atr_points + dist_points, index=idx
+    ).clip(0, 100).round().astype(int)
+
+    signal = pd.Series(np.select(
+        [total >= 70, total >= 40],
+        ["🔴 Risque élevé", "🟡 Risque modéré"],
+        default="🟢 Risque faible",
+    ), index=idx)
+
+    return pd.DataFrame(
+        {
+            "RISK_SCORE": total,
+            "RISK_SIGNAL": signal,
+            "RISK_Volatilite": volat_points,
+            "RISK_ATR": atr_points,
+            "RISK_Distance_SMA200": dist_points,
+        },
+        index=idx,
+    )
+
+
+def calculate_all_scores(df):
+    """Assemble les trois scores (Direction / Qualité / Risque) en un seul DataFrame indexé comme `df`."""
+    return pd.concat(
+        [
+            calculate_direction_score_series(df),
+            calculate_quality_score_series(df),
+            calculate_risk_score_series(df),
+        ],
+        axis=1,
+    )
+
+
+def get_latest_score(components, score_col, signal_col, detail_cols):
+    """
+    Extrait le score, le signal et le détail (dict libellé -> points) pour la dernière
+    ligne. `detail_cols` est un dict {libellé affiché: nom de colonne}.
+    """
     if components.empty:
         return 0, "⚪ N/A", {}
     row = components.iloc[-1]
-    details = {
-        "Tendance": int(row["Tendance"]),
-        "RSI": int(row["RSI_pts"]),
-        "MACD": int(row["MACD_pts"]),
-        "Bollinger": int(row["Bollinger_pts"]),
-        "Volume": int(row["Volume_pts"]),
-        "Momentum": int(row["Momentum_pts"]),
-    }
-    return int(row["SCORE"]), row["SIGNAL"], details
+    details = {label: int(row[col]) for label, col in detail_cols.items()}
+    return int(row[score_col]), row[signal_col], details
 
 
-def get_score_delta(components, lookback=1):
+def get_score_delta(components, score_col, lookback=1):
     """
-    Variation du score entre la dernière séance et celle `lookback` période(s) avant.
+    Variation d'un score entre la dernière séance et celle `lookback` période(s) avant.
     Retourne (delta, score_precedent) ou (np.nan, np.nan) si l'historique est trop court.
     """
     if len(components) <= lookback:
         return np.nan, np.nan
-    latest = int(components["SCORE"].iloc[-1])
-    previous = int(components["SCORE"].iloc[-1 - lookback])
+    latest = int(components[score_col].iloc[-1])
+    previous = int(components[score_col].iloc[-1 - lookback])
     return latest - previous, previous
 
 
@@ -951,25 +1057,32 @@ def backtest_strategy(
     take_profit_pct=0.0,
     sizing="fixed",
     annual_factor=252,
+    min_quality=0,
 ):
     """
     Backtest à une seule passe (O(n)).
-    - Le signal d'entrée est décidé sur le score de la veille (pas de fuite d'info).
+    - Le signal d'entrée est décidé sur le score DIRECTION de la veille (pas de fuite
+      d'info), optionnellement filtré par un score QUALITE minimal (si `min_quality` > 0
+      et que la colonne QUALITY_SCORE est disponible) : un signal directionnel fort mais
+      jugé bruité (ADX faible, volume absent, indicateurs contradictoires) est ignoré.
     - Le stop-loss / take-profit est vérifié intra-séance via le Low/High du jour.
     - Le sizing "volatility" réduit l'exposition quand l'ATR relatif est élevé.
     """
     data = df.copy()
-    if data.empty or "SCORE" not in data.columns:
+    if data.empty or "DIRECTION_SCORE" not in data.columns:
         return pd.DataFrame(), {}
 
     n = len(data)
     close = data["Close"].to_numpy()
     high = data["High"].to_numpy()
     low = data["Low"].to_numpy()
-    score = data["SCORE"].to_numpy()
+    score = data["DIRECTION_SCORE"].to_numpy()
     atr = data["ATR"].to_numpy() if "ATR" in data.columns else np.full(n, np.nan)
 
     signal_on = score >= threshold
+    if min_quality > 0 and "QUALITY_SCORE" in data.columns:
+        quality = data["QUALITY_SCORE"].to_numpy()
+        signal_on = signal_on & (quality >= min_quality)
 
     equity = np.empty(n)
     position_flag = np.zeros(n)
@@ -1046,7 +1159,7 @@ def backtest_strategy(
 
 
 def portfolio_backtest(all_data_scored, initial_capital, transaction_cost, threshold,
-                        stop_loss_pct, take_profit_pct, sizing, annual_factor):
+                        stop_loss_pct, take_profit_pct, sizing, annual_factor, min_quality=0):
     """
     Backtest agrégé (équipondéré, sans rebalancement quotidien explicite) : moyenne des
     courbes de capital normalisées de chaque actif. Approximation utile pour juger si le
@@ -1059,7 +1172,7 @@ def portfolio_backtest(all_data_scored, initial_capital, transaction_cost, thres
     for ticker, df in all_data_scored.items():
         bt, _ = backtest_strategy(
             df, initial_capital, transaction_cost, threshold,
-            stop_loss_pct, take_profit_pct, sizing, annual_factor,
+            stop_loss_pct, take_profit_pct, sizing, annual_factor, min_quality,
         )
         if bt.empty:
             continue
@@ -1161,20 +1274,21 @@ def bollinger_chart(df):
     return fig
 
 
-def score_history_chart(components, threshold):
+def score_history_chart(components, score_col, title, threshold=None):
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=components.index, y=components["SCORE"], name="Score",
+            x=components.index, y=components[score_col], name=title,
             line=dict(width=2), fill="tozeroy",
         )
     )
-    fig.add_hline(
-        y=threshold, line_dash="dash", line_color="orange",
-        annotation_text=f"Seuil d'entrée ({threshold})",
-    )
+    if threshold is not None:
+        fig.add_hline(
+            y=threshold, line_dash="dash", line_color="orange",
+            annotation_text=f"Seuil d'entrée ({threshold})",
+        )
     fig.update_layout(
-        title="Évolution du score technique dans le temps",
+        title=f"Évolution du score {title} dans le temps",
         height=350, yaxis=dict(range=[0, 100]), hovermode="x unified",
     )
     return fig
@@ -1347,8 +1461,18 @@ st.sidebar.caption(
 st.sidebar.markdown("---")
 st.sidebar.subheader("Backtest")
 
-threshold = st.sidebar.slider("Seuil d'entrée", 40, 90, 65, 5,
-                               help="Position ouverte quand le score de la veille dépasse ce seuil.")
+threshold = st.sidebar.slider("Seuil d'entrée (score Direction)", 40, 90, 65, 5,
+                               help="Position ouverte quand le score Direction de la veille dépasse ce seuil.")
+
+min_quality = st.sidebar.slider(
+    "Qualité minimale (optionnel)", 0, 90, 0, 5,
+    help=(
+        "0 = désactivé. Si > 0, un signal Direction n'ouvre une position que si le score "
+        "Qualité de la veille est aussi au-dessus de ce seuil — filtre les signaux "
+        "directionnels forts mais bruités (ADX faible, volume absent, indicateurs en "
+        "désaccord)."
+    ),
+)
 
 transaction_cost = st.sidebar.number_input(
     "Frais par transaction (%)", min_value=0.0, max_value=2.0, value=0.10, step=0.05,
@@ -1396,7 +1520,7 @@ ml_horizon = st.sidebar.slider(
 # ============================================================
 
 st.title("📈 Stock Analyzer V3")
-st.markdown("Analyse technique • Scanner • Score • Backtest robuste • Risque • Portefeuille")
+st.markdown("Analyse technique • Scanner • Direction / Qualité / Risque • Backtest robuste • Portefeuille")
 
 
 # ============================================================
@@ -1428,7 +1552,7 @@ with st.spinner("Calcul des indicateurs et des scores..."):
             skipped.append((ticker, f"Historique insuffisant ({len(df)} lignes < 50)"))
             continue
 
-        components = calculate_score_series(df)
+        components = calculate_all_scores(df)
         df = pd.concat([df, components], axis=1)
 
         slope_stats = rolling_regression_stats(df, window=regression_window)
@@ -1437,8 +1561,19 @@ with st.spinner("Calcul des indicateurs et des scores..."):
 
         all_data[ticker] = df
 
-        score, signal, details = get_latest_score_info(components)
-        score_delta, score_prev = get_score_delta(components, lookback=1)
+        direction_score, direction_signal, direction_details = get_latest_score(
+            components, "DIRECTION_SCORE", "DIRECTION_SIGNAL",
+            {"Tendance": "DIR_Tendance", "RSI": "DIR_RSI", "MACD": "DIR_MACD", "Momentum": "DIR_Momentum"},
+        )
+        quality_score, quality_signal, quality_details = get_latest_score(
+            components, "QUALITY_SCORE", "QUALITY_SIGNAL",
+            {"ADX": "QUAL_ADX", "Volume": "QUAL_Volume", "Cohérence": "QUAL_Coherence"},
+        )
+        risk_score, risk_signal, risk_details = get_latest_score(
+            components, "RISK_SCORE", "RISK_SIGNAL",
+            {"Volatilité": "RISK_Volatilite", "ATR": "RISK_ATR", "Distance SMA200": "RISK_Distance_SMA200"},
+        )
+        direction_delta, _ = get_score_delta(components, "DIRECTION_SCORE", lookback=1)
         trend = detect_trend(df)
         row = df.iloc[-1]
         close = safe_float(row["Close"])
@@ -1449,14 +1584,14 @@ with st.spinner("Calcul des indicateurs et des scores..."):
             if pd.notna(old) and old != 0:
                 one_month_return = (close / old - 1) * 100
 
-        if pd.isna(score_delta):
-            score_trend_icon = "⚪"
-        elif score_delta > 0:
-            score_trend_icon = "🔼"
-        elif score_delta < 0:
-            score_trend_icon = "🔽"
+        if pd.isna(direction_delta):
+            direction_trend_icon = "⚪"
+        elif direction_delta > 0:
+            direction_trend_icon = "🔼"
+        elif direction_delta < 0:
+            direction_trend_icon = "🔽"
         else:
-            score_trend_icon = "➖"
+            direction_trend_icon = "➖"
 
         results.append(
             {
@@ -1469,10 +1604,14 @@ with st.spinner("Calcul des indicateurs et des scores..."):
                 "Volatilité 20j": safe_float(row.get("VOLATILITY_20")),
                 "Volume / Moy.20": safe_float(row.get("VOLUME_RATIO")),
                 "Perf. 1 mois": one_month_return,
-                "Score": score,
-                "Δ Score (veille)": score_delta,
-                "Tendance score": score_trend_icon,
-                "Signal": signal,
+                "Direction": direction_score,
+                "Δ Direction (veille)": direction_delta,
+                "Tendance direction": direction_trend_icon,
+                "Qualité": quality_score,
+                "Risque": risk_score,
+                "Signal": direction_signal,
+                "Signal qualité": quality_signal,
+                "Signal risque": risk_signal,
                 "Tendance": trend,
             }
         )
@@ -1487,7 +1626,7 @@ if not results:
     st.stop()
 
 results_df = pd.DataFrame(results)
-results_df = results_df.sort_values("Score", ascending=False).reset_index(drop=True)
+results_df = results_df.sort_values("Direction", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
@@ -1501,11 +1640,14 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Actions analysées", len(results_df))
 with c2:
-    st.metric("Meilleure action", f"{best['Ticker']} — {int(best['Score'])}/100")
+    st.metric(
+        "Meilleure Direction", f"{best['Ticker']} — {int(best['Direction'])}/100",
+        help="Trié par score Direction. Vérifiez aussi sa Qualité avant d'agir — un score Direction élevé sur un signal bruité (🔴) est moins fiable.",
+    )
 with c3:
-    st.metric("Signaux ≥ 65", int((results_df["Score"] >= 65).sum()))
+    st.metric("Direction ≥ 65", int((results_df["Direction"] >= 65).sum()))
 with c4:
-    st.metric("Signaux < 50", int((results_df["Score"] < 50).sum()))
+    st.metric("Qualité ≥ 70 (signal propre)", int((results_df["Qualité"] >= 70).sum()))
 
 
 # ============================================================
@@ -1513,6 +1655,12 @@ with c4:
 # ============================================================
 
 st.subheader("🏆 Classement technique")
+st.caption(
+    "**Direction** : la structure favorise-t-elle une hausse ? • **Qualité** : ce signal "
+    "est-il propre ou bruité (0-100, plus haut = plus fiable) ? • **Risque** : dangerosité "
+    "de la position (0-100, plus haut = plus risqué). Les trois sont volontairement séparés "
+    "plutôt que fondus en un seul chiffre — voir la section Limites pour le détail."
+)
 
 numeric_cols = results_df.select_dtypes(include=[np.number]).columns
 display_df = results_df.copy()
@@ -1521,8 +1669,13 @@ display_df[numeric_cols] = display_df[numeric_cols].round(2)
 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 fig = go.Figure()
-fig.add_bar(x=results_df["Ticker"], y=results_df["Score"], text=results_df["Score"], textposition="auto")
-fig.update_layout(title="Score technique", yaxis=dict(range=[0, 100]), height=400)
+fig.add_bar(x=results_df["Ticker"], y=results_df["Direction"], name="Direction", marker_color="#1f77b4")
+fig.add_bar(x=results_df["Ticker"], y=results_df["Qualité"], name="Qualité", marker_color="#2ca02c")
+fig.add_bar(x=results_df["Ticker"], y=results_df["Risque"], name="Risque", marker_color="#d62728")
+fig.update_layout(
+    title="Direction / Qualité / Risque par action",
+    yaxis=dict(range=[0, 100]), height=420, barmode="group",
+)
 st.plotly_chart(fig, use_container_width=True)
 
 
@@ -1569,14 +1722,31 @@ if live:
             "Pas un flux temps réel garanti — voir la note sur l'actualisation dans la barre latérale."
         )
 
-components = df[["SCORE", "SIGNAL", "Tendance", "RSI_pts", "MACD_pts", "Bollinger_pts", "Volume_pts", "Momentum_pts"]]
+components = df[[
+    "DIRECTION_SCORE", "DIRECTION_SIGNAL", "DIR_Tendance", "DIR_RSI", "DIR_MACD", "DIR_Momentum",
+    "QUALITY_SCORE", "QUALITY_SIGNAL", "QUAL_ADX", "QUAL_Volume", "QUAL_Coherence",
+    "RISK_SCORE", "RISK_SIGNAL", "RISK_Volatilite", "RISK_ATR", "RISK_Distance_SMA200",
+]]
 
-score, signal, details = get_latest_score_info(components)
-score_delta, score_prev = get_score_delta(components, lookback=1)
+direction_score, direction_signal, direction_details = get_latest_score(
+    components, "DIRECTION_SCORE", "DIRECTION_SIGNAL",
+    {"Tendance": "DIR_Tendance", "RSI": "DIR_RSI", "MACD": "DIR_MACD", "Momentum": "DIR_Momentum"},
+)
+quality_score, quality_signal, quality_details = get_latest_score(
+    components, "QUALITY_SCORE", "QUALITY_SIGNAL",
+    {"ADX": "QUAL_ADX", "Volume": "QUAL_Volume", "Cohérence": "QUAL_Coherence"},
+)
+risk_score, risk_signal, risk_details = get_latest_score(
+    components, "RISK_SCORE", "RISK_SIGNAL",
+    {"Volatilité": "RISK_Volatilite", "ATR": "RISK_ATR", "Distance SMA200": "RISK_Distance_SMA200"},
+)
+direction_delta, _ = get_score_delta(components, "DIRECTION_SCORE", lookback=1)
+quality_delta, _ = get_score_delta(components, "QUALITY_SCORE", lookback=1)
+risk_delta, _ = get_score_delta(components, "RISK_SCORE", lookback=1)
 trend = detect_trend(df)
 row = df.iloc[-1]
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Prix", fmt(row["Close"]))
 with c2:
@@ -1585,21 +1755,50 @@ with c3:
     st.metric("SMA 50", fmt(row["SMA_50"]))
 with c4:
     st.metric("SMA 200", fmt(row["SMA_200"]))
+
+st.markdown("**Les trois scores** — séparés plutôt que fondus en un seul chiffre : un score Direction élevé n'a de sens que si la Qualité est bonne (signal propre, pas bruité), et le Risque s'apprécie indépendamment des deux.")
+c5, c6, c7 = st.columns(3)
 with c5:
     st.metric(
-        "Score",
-        f"{score}/100",
-        delta=None if pd.isna(score_delta) else f"{score_delta:+d} vs veille",
-        help="Heuristique pondérée (tendance, RSI, MACD, Bollinger, volume, momentum). Non calibrée statistiquement — voir la section Limites.",
+        "🟢 Direction", f"{direction_score}/100",
+        delta=None if pd.isna(direction_delta) else f"{direction_delta:+d} vs veille",
+        help="La structure actuelle (tendance SMA, RSI, MACD, momentum) favorise-t-elle une hausse ? Heuristique non calibrée — voir Limites.",
     )
+    st.caption(direction_signal)
 with c6:
-    st.metric("Signal", signal)
+    st.metric(
+        "🔵 Qualité", f"{quality_score}/100",
+        delta=None if pd.isna(quality_delta) else f"{quality_delta:+d} vs veille",
+        help="Ce signal Direction est-il propre (ADX élevé, volume qui confirme, indicateurs d'accord entre eux) ou bruité ?",
+    )
+    st.caption(quality_signal)
+with c7:
+    st.metric(
+        "🟠 Risque", f"{risk_score}/100",
+        delta=None if pd.isna(risk_delta) else f"{risk_delta:+d} vs veille",
+        delta_color="inverse",  # une hausse du risque n'est pas une "bonne" variation
+        help="Dangerosité de la position (volatilité, ATR relatif, écart à la SMA200). Plus haut = plus risqué.",
+    )
+    st.caption(risk_signal)
 
 st.info(f"**Tendance :** {trend}")
-st.progress(score / 100, text=f"Score technique : {score}/100")
 
-st.subheader("Décomposition du score")
-detail_df = pd.DataFrame({"Indicateur": list(details.keys()), "Points": list(details.values())})
+st.subheader("Décomposition des scores")
+detail_df = pd.DataFrame(
+    {
+        "Score": (
+            ["Direction"] * len(direction_details)
+            + ["Qualité"] * len(quality_details)
+            + ["Risque"] * len(risk_details)
+        ),
+        "Composante": (
+            list(direction_details.keys()) + list(quality_details.keys()) + list(risk_details.keys())
+        ),
+        "Points": (
+            list(direction_details.values()) + list(quality_details.values()) + list(risk_details.values())
+        ),
+    }
+)
 st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
 st.subheader("🔔 Signaux techniques récents")
@@ -1636,6 +1835,20 @@ with tab3:
         st.metric("ATR 14", fmt(row.get("ATR"), 2))
 
 with tab4:
+    score_choice = st.radio(
+        "Score affiché",
+        ["🟢 Direction", "🔵 Qualité", "🟠 Risque"],
+        index=0,
+        horizontal=True,
+        key="score_history_choice",
+    )
+    score_col_map = {
+        "🟢 Direction": ("DIRECTION_SCORE", "DIRECTION_SIGNAL", "Direction"),
+        "🔵 Qualité": ("QUALITY_SCORE", "QUALITY_SIGNAL", "Qualité"),
+        "🟠 Risque": ("RISK_SCORE", "RISK_SIGNAL", "Risque"),
+    }
+    score_col, signal_col, score_title = score_col_map[score_choice]
+
     window_choice = st.radio(
         "Fenêtre affichée",
         ["10 séances", "20 séances", "60 séances", "Tout l'historique"],
@@ -1647,22 +1860,26 @@ with tab4:
     n_sessions = window_map[window_choice]
     components_window = components if n_sessions is None else components.tail(n_sessions)
 
-    st.plotly_chart(score_history_chart(components_window, threshold), use_container_width=True)
-    st.caption("Permet de voir si le score est stable dans le temps ou s'il oscille beaucoup autour du seuil.")
+    chart_threshold = threshold if score_col == "DIRECTION_SCORE" else None
+    st.plotly_chart(
+        score_history_chart(components_window, score_col, score_title, threshold=chart_threshold),
+        use_container_width=True,
+    )
+    st.caption(f"Permet de voir si le score {score_title} est stable dans le temps ou s'il oscille beaucoup.")
 
     st.markdown("**Détail jour par jour**")
     table_n = min(n_sessions or 30, 30)  # la table reste lisible même si le graphique montre tout
-    daily = components["SCORE"].tail(table_n + 1).to_frame()
-    daily["Δ vs veille"] = daily["SCORE"].diff()
+    daily = components[score_col].tail(table_n + 1).to_frame()
+    daily["Δ vs veille"] = daily[score_col].diff()
     daily = daily.iloc[1:].sort_index(ascending=False)  # la 1ère ligne sert seulement au calcul du 1er delta
     daily_display = pd.DataFrame(
         {
             "Date": daily.index.strftime("%Y-%m-%d"),
-            "Score": daily["SCORE"].astype(int),
+            score_title: daily[score_col].astype(int),
             "Δ vs veille": daily["Δ vs veille"].apply(
                 lambda v: "—" if pd.isna(v) else f"{int(v):+d}"
             ),
-            "Signal": components.loc[daily.index, "SIGNAL"].values,
+            "Signal": components.loc[daily.index, signal_col].values,
         }
     )
     st.dataframe(daily_display, use_container_width=True, hide_index=True)
@@ -1926,12 +2143,16 @@ with ml_tab:
 st.markdown("---")
 st.header("🧪 Backtest — action sélectionnée")
 
+quality_filter_text = (
+    f" • Qualité minimale : **{min_quality}/100**" if min_quality > 0 else " • Pas de filtre Qualité"
+)
 st.write(
     f"""
-    Position ouverte lorsque le score de la veille atteint **{threshold}/100** (signal décalé
-    d'une période pour éviter tout effet de bord). Frais simulés : **{transaction_cost:.2f}%**
-    par changement de position. Stop-loss : **{stop_loss_pct:.1f}%** •
-    Take-profit : **{take_profit_pct:.1f}%** (0 = désactivé) • Sizing : **{sizing_label}**.
+    Position ouverte lorsque le score **Direction** de la veille atteint **{threshold}/100**
+    (signal décalé d'une période pour éviter tout effet de bord){quality_filter_text}.
+    Frais simulés : **{transaction_cost:.2f}%** par changement de position.
+    Stop-loss : **{stop_loss_pct:.1f}%** • Take-profit : **{take_profit_pct:.1f}%**
+    (0 = désactivé) • Sizing : **{sizing_label}**.
     """
 )
 
@@ -1939,7 +2160,7 @@ if st.button("▶️ Lancer le backtest", type="primary"):
     with st.spinner("Calcul du backtest..."):
         bt, metrics = backtest_strategy(
             df, initial_capital, transaction_cost / 100, threshold,
-            stop_loss_pct, take_profit_pct, sizing, annual_factor,
+            stop_loss_pct, take_profit_pct, sizing, annual_factor, min_quality,
         )
 
     if bt.empty:
@@ -1995,7 +2216,7 @@ if st.button("▶️ Lancer le backtest de portefeuille"):
     with st.spinner("Calcul du backtest de portefeuille..."):
         pf_bt, pf_metrics = portfolio_backtest(
             all_data, initial_capital, transaction_cost / 100, threshold,
-            stop_loss_pct, take_profit_pct, sizing, annual_factor,
+            stop_loss_pct, take_profit_pct, sizing, annual_factor, min_quality,
         )
 
     if pf_bt.empty:
@@ -2030,14 +2251,22 @@ st.markdown("---")
 with st.expander("⚠️ Limites de cet outil — à lire avant toute décision"):
     st.markdown(
         """
-- **Le score est une heuristique, pas un modèle validé statistiquement.** Les poids
-  (tendance 40, RSI 20, MACD 15, Bollinger 10, volume 10, momentum 5) et les seuils ont été
-  choisis à la main, pas calibrés sur des données. Rien ne garantit qu'ils ont un pouvoir
-  prédictif réel.
-- **Le backtest n'est pas out-of-sample.** Le seuil d'entrée est réglable librement en
-  observant les résultats passés, ce qui invite à l'ajuster jusqu'à trouver ce qui a "bien
-  marché" — un biais de surapprentissage classique. Une validation sérieuse nécessiterait un
-  découpage entraînement / test (walk-forward) sur plusieurs sous-périodes.
+- **Les trois scores (Direction/Qualité/Risque) sont des heuristiques, pas des modèles
+  validés statistiquement.** Les regrouper en trois catégories plutôt qu'un seul chiffre
+  réduit le mélange d'informations différentes dans un même nombre, et chaque composant
+  n'apparaît que dans un seul score pour éviter de compter la même information plusieurs
+  fois (ex. ADX n'est utilisé que dans Qualité, pas aussi dans Direction). Mais les poids
+  et seuils à l'intérieur de chaque score restent choisis à la main, pas calibrés sur des
+  données — un test walk-forward a par exemple montré que la pente de régression apportait
+  une information marginale négligeable une fois RSI/MACD/ADX déjà présents, ce qui a guidé
+  son exclusion des scores plutôt qu'une intuition. Rien ne garantit un pouvoir prédictif
+  réel des trois scores eux-mêmes : seul le module ML (walk-forward, AUC affiché) est
+  réellement calibré sur les prix passés.
+- **Le backtest n'est pas out-of-sample.** Le seuil d'entrée (et le filtre Qualité) sont
+  réglables librement en observant les résultats passés, ce qui invite à les ajuster jusqu'à
+  trouver ce qui a "bien marché" — un biais de surapprentissage classique. Une validation
+  sérieuse nécessiterait un découpage entraînement / test (walk-forward) sur plusieurs
+  sous-périodes.
 - **Coûts de transaction simplifiés.** Seuls des frais fixes par changement de position sont
   modélisés. Le slippage, le spread bid/ask et l'impact de marché ne le sont pas — la
   performance réelle serait probablement inférieure à celle affichée, surtout avec un nombre
