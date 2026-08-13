@@ -750,13 +750,19 @@ ML_FEATURE_COLUMNS = [
     "RSI", "MACD", "MACD_HIST", "ADX", "VOLUME_RATIO", "VOLATILITY_20",
 ]
 
+ML_REGRESSION_FEATURE_COLUMNS = ["REG_SLOPE_PCT", "REG_R2"]
 
-def build_ml_dataset(df, horizon=5):
+
+def build_ml_dataset(df, horizon=5, include_regression_features=False):
     """
     Construit X (features) / y (cible binaire : hausse à horizon `horizon` périodes)
     à partir des indicateurs déjà calculés de façon causale. Ajoute quelques features
     dérivées (distance relative aux moyennes mobiles, position dans les bandes de
     Bollinger, rendement récent) qui ne dépendent, comme le reste, que du passé.
+
+    `include_regression_features` ajoute la pente de régression glissante (% du prix) et
+    son R² — utile pour tester empiriquement si elles apportent une information marginale
+    par rapport aux indicateurs déjà présents (RSI/MACD/ADX), plutôt que de le supposer.
     """
     data = df.copy()
 
@@ -770,6 +776,9 @@ def build_ml_dataset(df, horizon=5):
     feature_cols = ML_FEATURE_COLUMNS + [
         "DIST_SMA50", "DIST_SMA200", "BB_POSITION", "RET_5", "RET_10",
     ]
+    if include_regression_features:
+        feature_cols = feature_cols + ML_REGRESSION_FEATURE_COLUMNS
+
     feature_cols = [c for c in feature_cols if c in data.columns]
 
     # Cible : le cours sera-t-il plus haut dans `horizon` périodes ?
@@ -1421,6 +1430,11 @@ with st.spinner("Calcul des indicateurs et des scores..."):
 
         components = calculate_score_series(df)
         df = pd.concat([df, components], axis=1)
+
+        slope_stats = rolling_regression_stats(df, window=regression_window)
+        df["REG_SLOPE_PCT"] = slope_stats["SLOPE_PCT"]
+        df["REG_R2"] = slope_stats["R2"]
+
         all_data[ticker] = df
 
         score, signal, details = get_latest_score_info(components)
@@ -1757,10 +1771,29 @@ with ml_tab:
             "indicateurs techniques déjà calculés."
         )
 
+        compare_slope_features = st.checkbox(
+            "Comparer avec / sans les features de pente de régression glissante",
+            value=True,
+            help=(
+                "Teste empiriquement si la pente glissante (% du prix) et son R² "
+                "apportent une information marginale par rapport à RSI/MACD/ADX déjà "
+                "présents, plutôt que de le supposer à l'œil sur un graphique."
+            ),
+        )
+
         if st.button("▶️ Entraîner et évaluer le modèle", type="primary"):
             with st.spinner("Construction du jeu de données et validation walk-forward..."):
-                dataset, feature_cols = build_ml_dataset(df, horizon=ml_horizon)
+                dataset, feature_cols = build_ml_dataset(
+                    df, horizon=ml_horizon, include_regression_features=False
+                )
                 eval_result = walk_forward_evaluation(dataset, feature_cols)
+
+                eval_ext = None
+                if compare_slope_features:
+                    dataset_ext, feature_cols_ext = build_ml_dataset(
+                        df, horizon=ml_horizon, include_regression_features=True
+                    )
+                    eval_ext = walk_forward_evaluation(dataset_ext, feature_cols_ext)
 
             if eval_result is None:
                 st.error(
@@ -1774,48 +1807,105 @@ with ml_tab:
                 mean_naive_brier = folds["Brier_naif"].mean()
                 base_rate = eval_result["base_rate"]
 
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric(
-                        "AUC moyen (walk-forward)", fmt(mean_auc, 3),
-                        help="0.50 = équivalent au hasard. > 0.55 déjà notable sur des prix d'actions. > 0.65 est rare et mérite d'être vérifié pour de la fuite de données.",
-                    )
-                with c2:
-                    st.metric(
-                        "Brier score du modèle", fmt(mean_brier, 3),
-                        help="Plus bas = mieux calibré. À comparer au Brier naïf ci-contre.",
-                    )
-                with c3:
-                    st.metric("Brier score naïf (fréquence de base)", fmt(mean_naive_brier, 3))
-                with c4:
-                    st.metric("Fréquence historique de hausse", fmt(base_rate * 100, 1, "%"))
+                if compare_slope_features and eval_ext is not None:
+                    folds_ext = eval_ext["folds"]
+                    mean_auc_ext = folds_ext["AUC"].mean()
+                    mean_brier_ext = folds_ext["Brier"].mean()
 
-                if mean_auc < 0.53:
-                    st.warning(
-                        "AUC proche de 0,50 : ce modèle n'apporte quasiment aucune information "
-                        "directionnelle sur ce titre avec cet horizon. Le considérer comme non "
-                        "informatif plutôt que d'en tirer un signal."
-                    )
-                elif mean_brier >= mean_naive_brier:
-                    st.warning(
-                        "Le modèle ne bat pas la base de référence naïve (fréquence historique "
-                        "de hausse) en termes de calibration. Il n'apporte pas d'avantage "
-                        "démontré ici."
-                    )
+                    st.markdown("**Sans pente glissante vs avec pente glissante**")
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric("AUC — sans pente", fmt(mean_auc, 3))
+                    with c2:
+                        st.metric(
+                            "AUC — avec pente", fmt(mean_auc_ext, 3),
+                            delta=f"{mean_auc_ext - mean_auc:+.3f}",
+                        )
+                    with c3:
+                        st.metric("Brier — sans pente", fmt(mean_brier, 3))
+                    with c4:
+                        st.metric(
+                            "Brier — avec pente", fmt(mean_brier_ext, 3),
+                            delta=f"{mean_brier_ext - mean_brier:+.3f}",
+                            delta_color="inverse",  # un Brier plus bas est meilleur
+                        )
+
+                    auc_gain = mean_auc_ext - mean_auc
+                    if abs(auc_gain) < 0.01:
+                        st.info(
+                            f"Écart d'AUC de {auc_gain:+.3f} sur {selected} à cet horizon : "
+                            "négligeable. La pente glissante n'apporte pas d'information "
+                            "supplémentaire mesurable par rapport à RSI/MACD/ADX déjà "
+                            "présents — l'hypothèse de redondance se confirme empiriquement "
+                            "sur ce titre et cette période."
+                        )
+                    elif auc_gain >= 0.01:
+                        st.success(
+                            f"Écart d'AUC de {auc_gain:+.3f} : la pente glissante apporte un "
+                            "gain mesurable ici. À vérifier sur d'autres titres/horizons "
+                            "avant d'en tirer une conclusion générale — un seul test n'est "
+                            "pas une preuve robuste."
+                        )
+                    else:
+                        st.warning(
+                            f"Écart d'AUC de {auc_gain:+.3f} : le modèle avec pente glissante "
+                            "fait *moins bien* ici, probablement parce qu'elle ajoute du bruit "
+                            "corrélé aux features existantes sans info nouvelle (dimension "
+                            "supplémentaire à estimer, pour un jeu de données déjà limité)."
+                        )
+
+                    # La suite du détail (calibration, probabilité) porte sur le modèle
+                    # "avec pente" pour rester cohérent avec la comparaison ci-dessus.
+                    active_eval = eval_ext
+                    active_dataset, active_feature_cols = dataset_ext, feature_cols_ext
+                    detail_label = "avec pente glissante"
+                else:
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric(
+                            "AUC moyen (walk-forward)", fmt(mean_auc, 3),
+                            help="0.50 = équivalent au hasard. > 0.55 déjà notable sur des prix d'actions. > 0.65 est rare et mérite d'être vérifié pour de la fuite de données.",
+                        )
+                    with c2:
+                        st.metric(
+                            "Brier score du modèle", fmt(mean_brier, 3),
+                            help="Plus bas = mieux calibré. À comparer au Brier naïf ci-contre.",
+                        )
+                    with c3:
+                        st.metric("Brier score naïf (fréquence de base)", fmt(mean_naive_brier, 3))
+                    with c4:
+                        st.metric("Fréquence historique de hausse", fmt(base_rate * 100, 1, "%"))
+
+                    if mean_auc < 0.53:
+                        st.warning(
+                            "AUC proche de 0,50 : ce modèle n'apporte quasiment aucune information "
+                            "directionnelle sur ce titre avec cet horizon. Le considérer comme non "
+                            "informatif plutôt que d'en tirer un signal."
+                        )
+                    elif mean_brier >= mean_naive_brier:
+                        st.warning(
+                            "Le modèle ne bat pas la base de référence naïve (fréquence historique "
+                            "de hausse) en termes de calibration. Il n'apporte pas d'avantage "
+                            "démontré ici."
+                        )
+
+                    active_eval = eval_result
+                    active_dataset, active_feature_cols = dataset, feature_cols
+                    detail_label = "sans pente glissante"
 
                 st.plotly_chart(
-                    reliability_diagram(eval_result["test_probs"], eval_result["test_true"]),
+                    reliability_diagram(active_eval["test_probs"], active_eval["test_true"]),
                     use_container_width=True,
                 )
 
-                with st.expander("Détail par pli de validation (walk-forward)"):
-                    st.dataframe(folds.round(3), use_container_width=True, hide_index=True)
+                with st.expander(f"Détail par pli de validation (walk-forward, modèle {detail_label})"):
+                    st.dataframe(active_eval["folds"].round(3), use_container_width=True, hide_index=True)
 
                 st.markdown("---")
-                proba = predict_latest_probability(dataset, feature_cols)
+                proba = predict_latest_probability(active_dataset, active_feature_cols)
                 if pd.notna(proba):
                     st.metric(
-                        f"Probabilité estimée de hausse à {ml_horizon} période(s)",
+                        f"Probabilité estimée de hausse à {ml_horizon} période(s) (modèle {detail_label})",
                         f"{proba * 100:.1f}%",
                         help="Calculée par un modèle entraîné sur tout l'historique labellisé disponible. Sa fiabilité est celle mesurée ci-dessus, pas une garantie.",
                     )
