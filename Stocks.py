@@ -533,6 +533,95 @@ def get_score_delta(components, score_col, lookback=1):
 
 
 # ============================================================
+# RECOMMANDATION DE POSITION (Garder / Renforcer / Vendre)
+# ============================================================
+
+def generate_position_recommendation(
+    direction_score, quality_score, risk_score, pnl_pct, stop_loss_pct,
+    direction_vente_seuil=50, qualite_fiable_seuil=40,
+    direction_haussier_seuil=65, qualite_propre_seuil=70, risque_eleve_seuil=70,
+):
+    """
+    Traduit les trois scores + le P&L latent en une recommandation actionnable, pour un
+    titre DÉJÀ détenu. Volontairement un arbre de règles explicite (if/elif) plutôt qu'un
+    nouveau score composite pondéré : chaque recommandation est justifiée par une règle
+    identifiable et lisible, pas par une somme de poids invisibles. Reste une heuristique
+    non calibrée, comme les scores dont elle dépend — voir "Limites de l'outil".
+
+    Les 5 seuils sont réglables (sidebar) plutôt que figés dans le code :
+    - direction_vente_seuil : sous ce score Direction, lecture baissière (règle 2)
+    - qualite_fiable_seuil : sous ce score Qualité, signal jugé trop bruité pour agir (règles 2 et 5)
+    - direction_haussier_seuil : à partir de ce score Direction, lecture haussière (règles 3 et 4)
+    - qualite_propre_seuil : à partir de ce score Qualité, signal jugé propre (règle 4)
+    - risque_eleve_seuil : à partir de ce score Risque, jugé élevé (règles 3 et 4)
+
+    Retourne (label, couleur, explication).
+    """
+    # 1) Règle de gestion du risque : protège le capital, prioritaire sur toute lecture
+    #    technique — un stop-loss touché reste un stop-loss touché.
+    if stop_loss_pct > 0 and pd.notna(pnl_pct) and pnl_pct <= -stop_loss_pct:
+        return (
+            "🔴 VENDRE",
+            "red",
+            f"Perte latente ({pnl_pct:+.1f}%) a atteint le stop-loss configuré "
+            f"(-{stop_loss_pct:.1f}%). Règle de gestion du risque, prioritaire sur la "
+            f"lecture technique du moment.",
+        )
+
+    # 2) Signal baissier jugé fiable (pas juste du bruit)
+    if direction_score < direction_vente_seuil and quality_score >= qualite_fiable_seuil:
+        return (
+            "🔴 VENDRE",
+            "red",
+            f"Score Direction en zone vente ({direction_score}/100 < {direction_vente_seuil}), "
+            f"sur un signal jugé suffisamment propre pour ne pas l'ignorer "
+            f"(Qualité {quality_score}/100 ≥ {qualite_fiable_seuil}).",
+        )
+
+    # 3) Combinaison dangereuse : risque élevé sans direction clairement favorable
+    if risk_score >= risque_eleve_seuil and direction_score < direction_haussier_seuil:
+        return (
+            "🔴 VENDRE",
+            "red",
+            f"Risque élevé ({risk_score}/100 ≥ {risque_eleve_seuil}) combiné à une Direction "
+            f"pas clairement haussière ({direction_score}/100 < {direction_haussier_seuil}) : "
+            f"exposition disproportionnée par rapport au potentiel identifié.",
+        )
+
+    # 4) Configuration haussière forte, propre, et pas trop risquée
+    if (
+        direction_score >= direction_haussier_seuil
+        and quality_score >= qualite_propre_seuil
+        and risk_score < risque_eleve_seuil
+    ):
+        return (
+            "🟢 RENFORCER",
+            "green",
+            f"Direction haussière ({direction_score}/100 ≥ {direction_haussier_seuil}) confirmée "
+            f"par un signal propre (Qualité {quality_score}/100 ≥ {qualite_propre_seuil}) sans "
+            f"risque excessif (Risque {risk_score}/100 < {risque_eleve_seuil}).",
+        )
+
+    # 5) Signal trop bruité pour agir dans un sens ou l'autre
+    if quality_score < qualite_fiable_seuil:
+        return (
+            "🟡 GARDER",
+            "orange",
+            f"Signal bruité (Qualité {quality_score}/100 < {qualite_fiable_seuil}) : pas assez "
+            f"fiable pour justifier un renfort ou une vente. Attendre une lecture plus claire.",
+        )
+
+    # 6) Cas par défaut : rien ne déclenche de décision nette
+    return (
+        "🟡 GARDER",
+        "orange",
+        f"Aucune règle déclenchée : Direction {direction_score}/100, "
+        f"Qualité {quality_score}/100, Risque {risk_score}/100 ne justifient ni renfort "
+        f"ni vente dans l'état actuel.",
+    )
+
+
+# ============================================================
 # TENDANCE
 # ============================================================
 
@@ -1421,6 +1510,39 @@ with st.sidebar.expander("📥 Import en masse / réinitialiser"):
 
 tickers = list(st.session_state["watchlist"])
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("💼 Mes positions")
+st.sidebar.caption(
+    "Renseignez vos positions détenues (prix d'achat, quantité) pour obtenir une "
+    "recommandation Garder / Renforcer / Vendre plutôt qu'une simple lecture Direction."
+)
+
+if "positions" not in st.session_state:
+    st.session_state["positions"] = {}
+
+with st.sidebar.form("add_position_form", clear_on_submit=True):
+    pos_ticker = st.text_input("Ticker détenu", placeholder="ex : SOI.PA")
+    pos_price = st.number_input("Prix d'achat moyen", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    pos_qty = st.number_input("Quantité", min_value=0.0, value=0.0, step=1.0)
+    pos_submitted = st.form_submit_button("💾 Enregistrer la position", use_container_width=True)
+    if pos_submitted and pos_ticker.strip() and pos_price > 0 and pos_qty > 0:
+        pos_ticker_clean = pos_ticker.strip().upper()
+        st.session_state["positions"][pos_ticker_clean] = {"prix_achat": pos_price, "quantite": pos_qty}
+        if pos_ticker_clean not in st.session_state["watchlist"]:
+            st.session_state["watchlist"].append(pos_ticker_clean)
+        st.toast(f"Position enregistrée : {pos_ticker_clean}")
+        st.rerun()
+
+if st.session_state["positions"]:
+    for pos_ticker, pos_info in list(st.session_state["positions"].items()):
+        col_pos, col_pos_remove = st.sidebar.columns([4, 1])
+        col_pos.markdown(f"`{pos_ticker}` — {pos_info['quantite']:g} @ {pos_info['prix_achat']:.2f}")
+        if col_pos_remove.button("✕", key=f"remove_position_{pos_ticker}", help=f"Retirer la position {pos_ticker}"):
+            del st.session_state["positions"][pos_ticker]
+            st.rerun()
+else:
+    st.sidebar.caption("Aucune position enregistrée.")
+
 period = st.sidebar.selectbox("Historique", ["6mo", "1y", "2y", "5y", "10y", "max"], index=3)
 interval = st.sidebar.selectbox("Intervalle", ["1d", "1wk", "1mo"], index=0)
 
@@ -1498,6 +1620,34 @@ sizing_label = st.sidebar.selectbox(
     "Sizing des positions", ["Fixe (100%)", "Basé sur la volatilité (ATR)"], index=0,
 )
 sizing = "volatility" if "volatilité" in sizing_label else "fixed"
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎚️ Seuils de recommandation")
+st.sidebar.caption(
+    "Réglages de l'arbre de décision Garder / Renforcer / Vendre (voir 💼 Mes positions). "
+    "Le stop-loss ci-dessus reste toujours prioritaire sur ces seuils."
+)
+
+direction_vente_seuil = st.sidebar.slider(
+    "Direction sous laquelle → lecture baissière", 20, 60, 50, 5,
+    help="Sous ce score Direction (avec un signal jugé fiable), la recommandation penche vers VENDRE.",
+)
+qualite_fiable_seuil = st.sidebar.slider(
+    "Qualité minimale pour agir", 20, 60, 40, 5,
+    help="Sous ce score Qualité, le signal est jugé trop bruité pour déclencher un achat ou une vente — la recommandation reste GARDER.",
+)
+direction_haussier_seuil = st.sidebar.slider(
+    "Direction à partir de laquelle → lecture haussière", 50, 85, 65, 5,
+    help="À partir de ce score Direction, la structure est jugée favorable à un renfort (sous réserve de Qualité et Risque).",
+)
+qualite_propre_seuil = st.sidebar.slider(
+    "Qualité minimale pour renforcer", 50, 90, 70, 5,
+    help="À partir de ce score Qualité, le signal est jugé assez propre pour justifier un renfort de position.",
+)
+risque_eleve_seuil = st.sidebar.slider(
+    "Risque à partir duquel jugé élevé", 40, 90, 70, 5,
+    help="À partir de ce score Risque, la position est jugée trop dangereuse pour être renforcée, voire à vendre si la Direction n'est pas franchement haussière.",
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔮 Tendance à venir")
@@ -1680,6 +1830,79 @@ st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
+# MES POSITIONS — RECOMMANDATIONS
+# ============================================================
+
+tracked_positions = {
+    t: p for t, p in st.session_state.get("positions", {}).items() if t in all_data
+}
+
+if tracked_positions:
+    st.markdown("---")
+    st.header("💼 Mes positions — recommandations")
+    st.caption(
+        "Recommandation par règles explicites (pas un score composite caché) : le "
+        "stop-loss configuré dans la sidebar protège le capital en priorité, puis la "
+        "combinaison Direction / Qualité / Risque détermine Garder, Renforcer ou Vendre. "
+        "Cliquez sur une ligne dans « Analyse détaillée » pour voir le détail de la règle "
+        "appliquée à un titre précis."
+    )
+
+    position_rows = []
+    for pos_ticker, pos_info in tracked_positions.items():
+        pos_df = all_data[pos_ticker]
+        pos_row = pos_df.iloc[-1]
+        current_price = safe_float(pos_row["Close"])
+        entry_price = pos_info["prix_achat"]
+        qty = pos_info["quantite"]
+
+        pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else np.nan
+        pnl_eur = (current_price - entry_price) * qty if pd.notna(current_price) else np.nan
+
+        d_score = int(pos_row["DIRECTION_SCORE"])
+        q_score = int(pos_row["QUALITY_SCORE"])
+        r_score = int(pos_row["RISK_SCORE"])
+
+        reco_label, reco_color, reco_reason = generate_position_recommendation(
+            d_score, q_score, r_score, pnl_pct, stop_loss_pct,
+            direction_vente_seuil, qualite_fiable_seuil,
+            direction_haussier_seuil, qualite_propre_seuil, risque_eleve_seuil,
+        )
+
+        position_rows.append(
+            {
+                "Ticker": pos_ticker,
+                "Prix achat": entry_price,
+                "Qté": qty,
+                "Prix actuel": current_price,
+                "P&L %": pnl_pct,
+                "P&L (€)": pnl_eur,
+                "Direction": d_score,
+                "Qualité": q_score,
+                "Risque": r_score,
+                "Recommandation": reco_label,
+            }
+        )
+
+    positions_df = pd.DataFrame(position_rows)
+    numeric_pos_cols = positions_df.select_dtypes(include=[np.number]).columns
+    positions_display = positions_df.copy()
+    positions_display[numeric_pos_cols] = positions_display[numeric_pos_cols].round(2)
+    st.dataframe(positions_display, use_container_width=True, hide_index=True)
+
+    n_sell = int((positions_df["Recommandation"] == "🔴 VENDRE").sum())
+    n_add = int((positions_df["Recommandation"] == "🟢 RENFORCER").sum())
+    n_hold = int((positions_df["Recommandation"] == "🟡 GARDER").sum())
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("🟢 À renforcer", n_add)
+    with c2:
+        st.metric("🟡 À garder", n_hold)
+    with c3:
+        st.metric("🔴 À vendre", n_sell)
+
+
+# ============================================================
 # CORRELATIONS
 # ============================================================
 
@@ -1782,6 +2005,59 @@ with c7:
     st.caption(risk_signal)
 
 st.info(f"**Tendance :** {trend}")
+
+st.subheader("💼 Ma position sur ce titre")
+existing_position = st.session_state.get("positions", {}).get(selected)
+
+if existing_position:
+    entry_price = existing_position["prix_achat"]
+    qty = existing_position["quantite"]
+    current_price = safe_float(row["Close"])
+    pnl_pct = (current_price / entry_price - 1) * 100 if entry_price > 0 else np.nan
+    pnl_eur = (current_price - entry_price) * qty if pd.notna(current_price) else np.nan
+
+    reco_label, reco_color, reco_reason = generate_position_recommendation(
+        direction_score, quality_score, risk_score, pnl_pct, stop_loss_pct,
+        direction_vente_seuil, qualite_fiable_seuil,
+        direction_haussier_seuil, qualite_propre_seuil, risque_eleve_seuil,
+    )
+
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    with pc1:
+        st.metric("Prix d'achat", fmt(entry_price))
+    with pc2:
+        st.metric("Quantité", f"{qty:g}")
+    with pc3:
+        st.metric("P&L", f"{pnl_pct:+.1f}%" if pd.notna(pnl_pct) else "N/A", delta=fmt(pnl_eur, 2, " €") if pd.notna(pnl_eur) else None)
+    with pc4:
+        st.metric("Recommandation", reco_label)
+
+    if reco_color == "red":
+        st.error(f"**{reco_label}** — {reco_reason}")
+    elif reco_color == "green":
+        st.success(f"**{reco_label}** — {reco_reason}")
+    else:
+        st.warning(f"**{reco_label}** — {reco_reason}")
+
+    if st.button("🗑️ Retirer cette position", key=f"remove_pos_detail_{selected}"):
+        del st.session_state["positions"][selected]
+        st.rerun()
+else:
+    st.caption("Aucune position enregistrée pour ce titre.")
+    with st.form(f"add_position_detail_{selected}", clear_on_submit=True):
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            detail_pos_price = st.number_input("Prix d'achat moyen", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        with dc2:
+            detail_pos_qty = st.number_input("Quantité", min_value=0.0, value=0.0, step=1.0)
+        with dc3:
+            st.write("")
+            detail_pos_submit = st.form_submit_button("💾 Enregistrer")
+        if detail_pos_submit and detail_pos_price > 0 and detail_pos_qty > 0:
+            st.session_state["positions"][selected] = {
+                "prix_achat": detail_pos_price, "quantite": detail_pos_qty,
+            }
+            st.rerun()
 
 st.subheader("Décomposition des scores")
 detail_df = pd.DataFrame(
