@@ -200,6 +200,84 @@ def fetch_last_price(ticker):
     }
 
 
+def _dig(d, path):
+    """Extrait une valeur imbriquée en suivant `path` (liste de clés) ; None si absente à n'importe quel niveau."""
+    cur = d
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+        if cur is None:
+            return None
+    return cur
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news(ticker, max_items=8):
+    """
+    Récupère les articles récents liés au ticker (Yahoo Finance, via yfinance).
+
+    Purement factuel : titre, source et lien tels que renvoyés par Yahoo — AUCUN résumé
+    ni synthèse générée. Sur du contenu financier, un résumé halluciné (fausse citation,
+    faux chiffre) est plus dangereux qu'ailleurs si quelqu'un agit dessus ; on affiche donc
+    seulement ce qui existe réellement, à charge pour l'utilisateur de cliquer et lire à la
+    source. Extraction défensive car le schéma exact renvoyé par `yfinance` a changé
+    plusieurs fois par le passé (clés au premier niveau vs imbriquées sous "content").
+    """
+    try:
+        raw_items = yf.Ticker(ticker).news or []
+    except Exception:
+        return []
+
+    parsed = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        title = item.get("title") or _dig(item, ["content", "title"])
+        link = (
+            item.get("link")
+            or _dig(item, ["content", "canonicalUrl", "url"])
+            or _dig(item, ["content", "clickThroughUrl", "url"])
+        )
+        publisher = (
+            item.get("publisher")
+            or _dig(item, ["content", "provider", "displayName"])
+            or "Source inconnue"
+        )
+
+        if not title or not link:
+            continue  # rien d'exploitable à afficher sans titre ET lien
+
+        published_at = None
+        raw_ts = item.get("providerPublishTime")
+        if raw_ts is not None:
+            try:
+                published_at = pd.to_datetime(raw_ts, unit="s", utc=True)
+            except Exception:
+                published_at = None
+        if published_at is None:
+            raw_date = _dig(item, ["content", "pubDate"]) or _dig(item, ["content", "displayTime"])
+            if raw_date:
+                try:
+                    published_at = pd.to_datetime(raw_date, utc=True)
+                except Exception:
+                    published_at = None
+
+        parsed.append({
+            "title": title,
+            "link": link,
+            "publisher": publisher,
+            "published_at": published_at,
+        })
+
+    parsed.sort(
+        key=lambda x: x["published_at"] if x["published_at"] is not None else pd.Timestamp.min.tz_localize("UTC"),
+        reverse=True,
+    )
+    return parsed[:max_items]
+
+
 # ============================================================
 # INDICATEURS
 # ============================================================
@@ -2088,6 +2166,27 @@ else:
 
 st.subheader("📈 Cours")
 st.plotly_chart(price_chart(df, selected), use_container_width=True)
+
+st.subheader("📰 Actualités récentes")
+st.caption(
+    "Titres et liens tels que renvoyés par Yahoo Finance — aucun résumé ni synthèse "
+    "générée automatiquement : le risque d'erreur (fausse citation, faux chiffre) sur du "
+    "contenu financier résumé par une IA est trop élevé pour se fier à un résumé plutôt "
+    "qu'à la source. Cliquez sur un titre pour lire l'article complet."
+)
+news_items = fetch_news(selected)
+if not news_items:
+    st.caption("Aucun article récent trouvé pour ce titre (ou source indisponible).")
+else:
+    now_utc = pd.Timestamp.now(tz="UTC")
+    for item in news_items:
+        if item["published_at"] is not None:
+            delta_hours = (now_utc - item["published_at"]).total_seconds() / 3600
+            when = f"il y a {int(delta_hours)} h" if delta_hours < 24 else f"il y a {int(delta_hours / 24)} j"
+        else:
+            when = "date inconnue"
+        st.markdown(f"**[{item['title']}]({item['link']})**")
+        st.caption(f"{item['publisher']} • {when}")
 
 
 # ============================================================
