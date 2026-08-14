@@ -798,6 +798,83 @@ def detect_recent_signals(df, lookback=10, gap_threshold_pct=2.0):
     return sorted(events, key=lambda x: x[0], reverse=True)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def detect_gaps_with_fill_status(df, threshold_pct=2.0):
+    """
+    Détecte tous les gaps (écart Open vs Close de la veille ≥ `threshold_pct`) sur TOUT
+    l'historique téléchargé, et indique pour chacun s'il a depuis été « comblé » — le
+    cours est revenu retoucher le niveau de clôture pré-gap — et en combien de séances.
+
+    Un gap haussier est comblé quand le plus bas d'une séance (à partir du jour du gap
+    inclus, pour capter un retournement intraday) retouche la clôture pré-gap. Un gap
+    baissier est comblé quand le plus haut en fait autant, à la hausse. Un gap non comblé
+    agit souvent comme zone de support/résistance latente — observation empirique
+    répandue, pas une garantie de comportement futur.
+    """
+    idx = df.index
+    n = len(df)
+    close = df["Close"].to_numpy(dtype=float)
+    open_ = df["Open"].to_numpy(dtype=float)
+    low = df["Low"].to_numpy(dtype=float)
+    high = df["High"].to_numpy(dtype=float)
+
+    gaps = []
+    for i in range(1, n):
+        prev_close = close[i - 1]
+        curr_open = open_[i]
+        if prev_close == 0 or np.isnan(prev_close) or np.isnan(curr_open):
+            continue
+
+        gap_pct = (curr_open / prev_close - 1) * 100
+        if gap_pct >= threshold_pct:
+            direction = "up"
+        elif gap_pct <= -threshold_pct:
+            direction = "down"
+        else:
+            continue
+
+        fill_index = None
+        if direction == "up":
+            for j in range(i, n):
+                if pd.notna(low[j]) and low[j] <= prev_close:
+                    fill_index = j
+                    break
+        else:
+            for j in range(i, n):
+                if pd.notna(high[j]) and high[j] >= prev_close:
+                    fill_index = j
+                    break
+
+        gaps.append(
+            {
+                "date": idx[i],
+                "direction": direction,
+                "gap_pct": gap_pct,
+                "level": prev_close,
+                "filled": fill_index is not None,
+                "fill_date": idx[fill_index] if fill_index is not None else pd.NaT,
+                "sessions_to_fill": (fill_index - i) if fill_index is not None else np.nan,
+            }
+        )
+
+    return pd.DataFrame(
+        gaps,
+        columns=["date", "direction", "gap_pct", "level", "filled", "fill_date", "sessions_to_fill"],
+    )
+
+
+def nearest_open_gap(gaps_df, current_price):
+    """Repère le gap non comblé le plus proche du prix actuel — le plus pertinent comme support/résistance latent."""
+    if gaps_df.empty or pd.isna(current_price) or current_price == 0:
+        return None
+    open_gaps = gaps_df[~gaps_df["filled"]].copy()
+    if open_gaps.empty:
+        return None
+    open_gaps["distance_pct"] = (open_gaps["level"] / current_price - 1) * 100
+    open_gaps["abs_distance"] = open_gaps["distance_pct"].abs()
+    return open_gaps.sort_values("abs_distance").iloc[0]
+
+
 # ============================================================
 # MODULE DESCRIPTIF : ADX + CANAL DE REGRESSION
 # (extrapolation géométrique du passé récent — PAS une prédiction)
@@ -2191,6 +2268,57 @@ if recent_events:
     st.dataframe(events_df, use_container_width=True, hide_index=True)
 else:
     st.caption(f"Aucun croisement notable sur les {signal_lookback} dernières séances.")
+
+st.subheader("📊 Suivi des gaps")
+st.caption(
+    "Un gap est « comblé » quand le cours retouche depuis le niveau de clôture pré-gap. "
+    "Un gap non comblé agit souvent comme zone de support/résistance latente — "
+    "observation empirique répandue, pas une garantie de comportement futur."
+)
+gaps_df = detect_gaps_with_fill_status(df, threshold_pct=gap_threshold_pct)
+
+if gaps_df.empty:
+    st.caption(f"Aucun gap ≥ {gap_threshold_pct:.1f}% détecté sur l'historique chargé pour ce titre.")
+else:
+    n_total = len(gaps_df)
+    n_filled = int(gaps_df["filled"].sum())
+    n_open = n_total - n_filled
+
+    gc1, gc2, gc3 = st.columns(3)
+    with gc1:
+        st.metric("Gaps détectés (historique chargé)", n_total)
+    with gc2:
+        st.metric("Comblés", n_filled)
+    with gc3:
+        st.metric("Non comblés", n_open)
+
+    nearest = nearest_open_gap(gaps_df, safe_float(row["Close"]))
+    if nearest is not None:
+        direction_label = "haussier" if nearest["direction"] == "up" else "baissier"
+        side_label = "au-dessus" if nearest["distance_pct"] > 0 else "en-dessous"
+        st.info(
+            f"Gap {direction_label} non comblé le plus proche : niveau **{fmt(nearest['level'])}** "
+            f"({nearest['date'].strftime('%Y-%m-%d')}), soit **{abs(nearest['distance_pct']):.1f}%** "
+            f"{side_label} du cours actuel — zone de support/résistance latente la plus pertinente."
+        )
+
+    with st.expander(f"Détail des {min(n_total, 20)} derniers gaps"):
+        gaps_display = gaps_df.sort_values("date", ascending=False).head(20).copy()
+        gaps_display["Direction"] = np.where(gaps_display["direction"] == "up", "🟢⬆️ Haussier", "🔴⬇️ Baissier")
+        gaps_display["Statut"] = np.where(gaps_display["filled"], "✅ Comblé", "⏳ Non comblé")
+        gaps_display["Date"] = gaps_display["date"].dt.strftime("%Y-%m-%d")
+        gaps_display["Ampleur"] = gaps_display["gap_pct"].apply(lambda v: f"{v:+.1f}%")
+        gaps_display["Niveau"] = gaps_display["level"].apply(lambda v: fmt(v))
+        gaps_display["Comblé le"] = gaps_display["fill_date"].apply(
+            lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "—"
+        )
+        gaps_display["Délai (séances)"] = gaps_display["sessions_to_fill"].apply(
+            lambda v: str(int(v)) if pd.notna(v) else "—"
+        )
+        st.dataframe(
+            gaps_display[["Date", "Direction", "Ampleur", "Niveau", "Statut", "Comblé le", "Délai (séances)"]],
+            use_container_width=True, hide_index=True,
+        )
 
 st.subheader("📈 Cours")
 st.plotly_chart(price_chart(df, selected), use_container_width=True)
