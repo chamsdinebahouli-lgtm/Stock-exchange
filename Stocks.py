@@ -731,7 +731,7 @@ def detect_trend(df):
 # ALERTES / SIGNAUX RECENTS
 # ============================================================
 
-def detect_recent_signals(df, lookback=10):
+def detect_recent_signals(df, lookback=10, gap_threshold_pct=2.0):
     """Repère les croisements/événements techniques survenus dans les `lookback` dernières séances."""
     events = []
     recent = df.tail(lookback + 1)  # +1 pour pouvoir calculer les diff
@@ -741,6 +741,7 @@ def detect_recent_signals(df, lookback=10):
     macd = recent.get("MACD")
     macd_signal = recent.get("MACD_SIGNAL")
     close = recent["Close"]
+    open_price = recent.get("Open")
     sma50 = recent.get("SMA_50")
     rsi = recent.get("RSI")
     bb_upper = recent.get("BB_UPPER")
@@ -783,6 +784,16 @@ def detect_recent_signals(df, lookback=10):
                 events.append((date, "🟠 Cassure au-dessus de la bande de Bollinger haute"))
             elif pd.notna(curr_c) and pd.notna(curr_low) and curr_c < curr_low:
                 events.append((date, "🟠 Cassure en-dessous de la bande de Bollinger basse"))
+
+        if open_price is not None and gap_threshold_pct > 0:
+            prev_close = safe_float(close.iloc[i - 1])
+            curr_open = safe_float(open_price.iloc[i])
+            if pd.notna(prev_close) and pd.notna(curr_open) and prev_close != 0:
+                gap_pct = (curr_open / prev_close - 1) * 100
+                if gap_pct >= gap_threshold_pct:
+                    events.append((date, f"🟢⬆️ Gap haussier à l'ouverture (+{gap_pct:.1f}%)"))
+                elif gap_pct <= -gap_threshold_pct:
+                    events.append((date, f"🔴⬇️ Gap baissier à l'ouverture ({gap_pct:.1f}%)"))
 
     return sorted(events, key=lambda x: x[0], reverse=True)
 
@@ -1659,6 +1670,23 @@ st.sidebar.caption(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("🔔 Alertes techniques")
+
+signal_lookback = st.sidebar.slider(
+    "Fenêtre de détection (séances)", 5, 30, 10, 1,
+    help="Nombre de séances récentes scrutées pour les croisements MACD/SMA/RSI/Bollinger et les gaps, dans la section « Signaux techniques récents ».",
+)
+gap_threshold_pct = st.sidebar.slider(
+    "Seuil de gap (%)", 0.5, 10.0, 2.0, 0.5,
+    help=(
+        "Écart minimal entre l'ouverture du jour et la clôture de la veille pour être "
+        "signalé comme un gap. Un gap non comblé, surtout sur fort volume, peut annoncer "
+        "un changement de tendance (voir aussi la limite du backtest sur l'exécution du "
+        "stop-loss en cas de gap)."
+    ),
+)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Backtest")
 
 threshold = st.sidebar.slider("Seuil d'entrée (score Direction)", 40, 90, 65, 5,
@@ -2156,13 +2184,13 @@ detail_df = pd.DataFrame(
 st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
 st.subheader("🔔 Signaux techniques récents")
-recent_events = detect_recent_signals(df, lookback=10)
+recent_events = detect_recent_signals(df, lookback=signal_lookback, gap_threshold_pct=gap_threshold_pct)
 if recent_events:
     events_df = pd.DataFrame(recent_events, columns=["Date", "Événement"])
     events_df["Date"] = events_df["Date"].dt.strftime("%Y-%m-%d")
     st.dataframe(events_df, use_container_width=True, hide_index=True)
 else:
-    st.caption("Aucun croisement notable sur les 10 dernières séances.")
+    st.caption(f"Aucun croisement notable sur les {signal_lookback} dernières séances.")
 
 st.subheader("📈 Cours")
 st.plotly_chart(price_chart(df, selected), use_container_width=True)
