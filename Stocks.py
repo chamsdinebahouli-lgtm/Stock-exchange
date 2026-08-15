@@ -1571,23 +1571,6 @@ def drawdown_chart(equity):
     return fig
 
 
-def correlation_heatmap(all_data):
-    closes = {ticker: df["Close"] for ticker, df in all_data.items()}
-    price_df = pd.concat(closes, axis=1).sort_index().ffill()
-    returns = price_df.pct_change().dropna(how="all")
-    corr = returns.corr()
-
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=corr.values, x=corr.columns, y=corr.columns,
-            colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-            text=np.round(corr.values, 2), texttemplate="%{text}",
-        )
-    )
-    fig.update_layout(title="Corrélation des rendements quotidiens", height=500)
-    return fig
-
-
 # ============================================================
 # EXPORT
 # ============================================================
@@ -2001,16 +1984,6 @@ display_df[numeric_cols] = display_df[numeric_cols].round(2)
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-fig = go.Figure()
-fig.add_bar(x=results_df["Ticker"], y=results_df["Direction"], name="Direction", marker_color="#1f77b4")
-fig.add_bar(x=results_df["Ticker"], y=results_df["Qualité"], name="Qualité", marker_color="#2ca02c")
-fig.add_bar(x=results_df["Ticker"], y=results_df["Risque"], name="Risque", marker_color="#d62728")
-fig.update_layout(
-    title="Direction / Qualité / Risque par action",
-    yaxis=dict(range=[0, 100]), height=420, barmode="group",
-)
-st.plotly_chart(fig, use_container_width=True)
-
 
 # ============================================================
 # MES POSITIONS — RECOMMANDATIONS
@@ -2086,20 +2059,6 @@ if tracked_positions:
 
 
 # ============================================================
-# CORRELATIONS
-# ============================================================
-
-if len(all_data) >= 2:
-    st.markdown("---")
-    st.header("🔗 Corrélations entre actifs")
-    st.caption(
-        "Un panier de titres fortement corrélés diversifie moins que ce que leur nombre "
-        "suggère. Une valeur proche de 1 indique des mouvements très similaires."
-    )
-    st.plotly_chart(correlation_heatmap(all_data), use_container_width=True)
-
-
-# ============================================================
 # ANALYSE DETAILLEE
 # ============================================================
 
@@ -2108,6 +2067,32 @@ st.header("🔎 Analyse détaillée")
 
 selected = st.selectbox("Action", list(all_data.keys()))
 df = all_data[selected]
+
+st.subheader("📈 Cours")
+st.plotly_chart(price_chart(df, selected), use_container_width=True)
+
+st.subheader("📰 Actualités récentes")
+st.caption(
+    "Titres et liens tels que renvoyés par Yahoo Finance — aucun résumé ni synthèse "
+    "générée automatiquement : le risque d'erreur (fausse citation, faux chiffre) sur du "
+    "contenu financier résumé par une IA est trop élevé pour se fier à un résumé plutôt "
+    "qu'à la source. Cliquez sur un titre pour lire l'article complet."
+)
+news_items = fetch_news(selected)
+if not news_items:
+    st.caption("Aucun article récent trouvé pour ce titre (ou source indisponible).")
+else:
+    now_utc = pd.Timestamp.now(tz="UTC")
+    for item in news_items:
+        if item["published_at"] is not None:
+            delta_hours = (now_utc - item["published_at"]).total_seconds() / 3600
+            when = f"il y a {int(delta_hours)} h" if delta_hours < 24 else f"il y a {int(delta_hours / 24)} j"
+        else:
+            when = "date inconnue"
+        st.markdown(f"**[{item['title']}]({item['link']})**")
+        st.caption(f"{item['publisher']} • {when}")
+
+st.markdown("---")
 
 live = fetch_last_price(selected)
 if live:
@@ -2319,30 +2304,6 @@ else:
             gaps_display[["Date", "Direction", "Ampleur", "Niveau", "Statut", "Comblé le", "Délai (séances)"]],
             use_container_width=True, hide_index=True,
         )
-
-st.subheader("📈 Cours")
-st.plotly_chart(price_chart(df, selected), use_container_width=True)
-
-st.subheader("📰 Actualités récentes")
-st.caption(
-    "Titres et liens tels que renvoyés par Yahoo Finance — aucun résumé ni synthèse "
-    "générée automatiquement : le risque d'erreur (fausse citation, faux chiffre) sur du "
-    "contenu financier résumé par une IA est trop élevé pour se fier à un résumé plutôt "
-    "qu'à la source. Cliquez sur un titre pour lire l'article complet."
-)
-news_items = fetch_news(selected)
-if not news_items:
-    st.caption("Aucun article récent trouvé pour ce titre (ou source indisponible).")
-else:
-    now_utc = pd.Timestamp.now(tz="UTC")
-    for item in news_items:
-        if item["published_at"] is not None:
-            delta_hours = (now_utc - item["published_at"]).total_seconds() / 3600
-            when = f"il y a {int(delta_hours)} h" if delta_hours < 24 else f"il y a {int(delta_hours / 24)} j"
-        else:
-            when = "date inconnue"
-        st.markdown(f"**[{item['title']}]({item['link']})**")
-        st.caption(f"{item['publisher']} • {when}")
 
 
 # ============================================================
